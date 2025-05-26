@@ -474,6 +474,7 @@ class DistributedStorageManager:
         self,
         shape: torch.Size,
         dtype: torch.dtype,
+        fmt: MemoryFormat = MemoryFormat.KV_2LTD,
         eviction=True,
     ) -> Optional[MemoryObjMetadata]:
         """
@@ -481,7 +482,7 @@ class DistributedStorageManager:
         Use LRU evictor if eviction is enabled.
         """
         return self.storage_backend.get_underlying_allocator().dry_allocate(
-            shape, dtype)
+            shape, dtype, fmt)
 
     def prepare_put(
         self,
@@ -503,7 +504,24 @@ class DistributedStorageManager:
         keys: Sequence[CacheEngineKey],
         memory_objs: List[MemoryObj],
     ) -> None:
-        raise NotImplementedError
+        """
+        Non-blocking function to put multiple memory objects into the storage backend.
+        For the distributed storage manager, this is used after the metadata has been
+        registered and memory has been allocated.
+        
+        :param keys: List of keys for the memory objects
+        :param memory_objs: List of memory objects to store
+        """
+        # In the distributed case, we've already registered the metadata
+        # and allocated memory, so we just need to store the objects
+        for key, memory_obj in zip(keys, memory_objs, strict=False):
+            # NOTE: For zero-copy, we don't need to do anything here
+            # The memory is already in the right place
+            # Just update the backend's internal state
+            self.storage_backend.update_put_state(key, memory_obj)
+            
+            # Decrease reference count since we're done with this object
+            memory_obj.ref_count_down()
 
     @_lmcache_nvtx_annotate
     def commit_put(self):

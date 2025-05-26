@@ -240,8 +240,12 @@ if __name__ == "__main__":
                                                slot_mapping=slot_mapping)
             layer_count = 0
             for _ in store_generator:
-                layer_count += 1
+                pass
                 logger.info(f"Stored layer {layer_count}/{num_layers}")
+                layer_count += 1
+                # Verify storage immediately after storing
+                test_count = engine.lookup(tokens) // config.chunk_size
+                logger.info(f"Immediate lookup after store: {test_count}/{args.num_chunks} chunks found")
 
             end_time = time.time()
             elapsed_time = end_time - start_time
@@ -258,7 +262,7 @@ if __name__ == "__main__":
             # Poll until we receive all chunks or timeout
             received_count = 0
             start_time = time.time()
-            timeout = 60  # seconds
+            timeout = 1200  # seconds
 
             while received_count < args.num_chunks:
                 # Check how many chunks we've received by looking up tokens

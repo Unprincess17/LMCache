@@ -134,3 +134,15 @@ UCX_TLS=cuda_ipc,cuda_copy,tcp CUDA_VISIBLE_DEVICES=6 python3 test_nixl_channel_
 # Terminal 3 (Sender)
 UCX_TLS=cuda_ipc,cuda_copy,tcp CUDA_VISIBLE_DEVICES=3 python3 test_nixl_channel_v2.py --role sender --num-objs 500 --batch-size 30 --simulate-workload
 ```
+
+## NIXL Layerwise Cache Engine testing
+
+```bash
+# Terminal 1 (Sender)
+UCX_TLS=cuda_ipc,cuda_copy,tcp CUDA_VISIBLE_DEVICES=0 python3 test_nixl_layerwise_cache_engine.py --role sender --num-chunks 500 --num-rounds 5
+
+# Terminal 2 (Receiver)
+UCX_TLS=cuda_ipc,cuda_copy,tcp CUDA_VISIBLE_DEVICES=1 python3 test_nixl_layerwise_cache_engine.py --role receiver --num-chunks 500 --num-rounds 5
+```
+
+Measured performance: #TODO

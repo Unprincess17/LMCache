@@ -416,6 +416,19 @@ class NixlBackend(StorageBackendInterface):
     def unpin(self, key: CacheEngineKey) -> bool:
         raise NotImplementedError
 
+    def update_put_state(self, key: CacheEngineKey, memory_obj: MemoryObj) -> None:
+        """
+        Update the backend's internal state after a memory object has been allocated
+        and written to. This is used in the zero-copy write pattern.
+        
+        :param key: The key associated with the memory object
+        :param memory_obj: The memory object that has been written to
+        """
+        # For the Nixl backend, we don't need to do anything here
+        # The memory is already in the right place due to zero-copy allocation
+        # and the metadata was registered during prepare_put
+        pass
+
     @staticmethod
     def CreateNixlBackend(config: LMCacheEngineConfig,
                           metadata: LMCacheEngineMetadata) -> "NixlBackend":

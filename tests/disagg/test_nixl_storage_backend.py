@@ -6,7 +6,7 @@ import torch
 
 from lmcache.experimental.memory_management import (AdHocMemoryAllocator,
                                                     MemoryFormat, MemoryObj)
-from lmcache.experimental.storage_backend.connector.nixl_connector import (
+from lmcache.experimental.storage_backend.connector.nixl_connector_v2 import (
     NixlConfig, NixlRole)
 from lmcache.experimental.storage_backend.nixl_backend import NixlBackend
 from lmcache.logging import init_logger
@@ -51,7 +51,7 @@ def send_and_measure_throughput(backend: NixlBackend,
                                 keys: List[CacheEngineKey],
                                 objs: List[MemoryObj],
                                 wait_time: float = 2.0) -> float:
-    """Send objects through the backend and measure throughput.
+    """Send objects through the backend and measure throughput in zero-copy pattern.
     
     Args:
         backend: The NixlBackend instance
@@ -70,8 +70,18 @@ def send_and_measure_throughput(backend: NixlBackend,
 
     backend.register_put_tasks(keys, [obj.metadata for obj in objs])
     start_time = time.time()
-    for key, obj in zip(keys, objs, strict=False):
-        backend.submit_put_task(key, obj)
+    # For each object, allocate a zero-copy buffer and copy the data
+    for obj in objs:
+        zero_copy_obj = backend.allocate_zero_copy_write_object(
+            shape=obj.metadata.shape,
+            dtype=obj.metadata.dtype,
+            fmt=obj.metadata.fmt
+        )
+        # Copy the tensor data to the zero-copy buffer
+        if zero_copy_obj is not None and zero_copy_obj.tensor is not None and obj.tensor is not None:
+            zero_copy_obj.tensor.copy_(obj.tensor)
+    
+    # Flush to complete the transfer
     backend.flush_put_tasks()
     end_time = time.time()
 
@@ -195,7 +205,8 @@ if __name__ == "__main__":
         receiver_host=args.host,
         receiver_port=args.port,
         buffer_size=2**32,  # 4GB
-        buffer_device='cuda',
+        buffer_device='cuda:0',
+        enable_gc=False,
     )
 
     # Create the NixlBackend

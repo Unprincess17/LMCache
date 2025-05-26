@@ -31,7 +31,7 @@ from lmcache.experimental.memory_management import (MemoryAllocatorInterface,
 from lmcache.experimental.storage_backend.connector.nixl_utils import (
     NixlConfig, NixlRole)
 from lmcache.logging import init_logger
-from lmcache.utils import CacheEngineKey, _lmcache_nvtx_annotate
+from lmcache.utils import CacheEngineKey, LayerCacheEngineKey, _lmcache_nvtx_annotate
 
 logger = init_logger(__name__)
 
@@ -79,9 +79,11 @@ class NixlBufferAllocator(MemoryAllocatorInterface):
 
         if self.allocated_size + required_size > self.capacity:
             # If no enough space, try to flush
+            logger.debug(f"Flushing buffer to free space")
             self._flush()
 
         # allocate the memory
+        logger.debug(f"Allocating memory for {required_size} bytes at address {self.allocated_size}:{self.allocated_size + required_size}")
         raw_tensor = self.buffer[self.allocated_size : self.allocated_size\
                 + required_size]
         ret = TensorMemoryObj(raw_data=raw_tensor,
@@ -152,6 +154,8 @@ class NixlRequest:
         t = d["__type__"]
         if t == "CacheEngineKey":
             return CacheEngineKey.from_dict(d)
+        elif t == "LayerCacheEngineKey":
+            return LayerCacheEngineKey.from_dict(d)
         elif t == "MemoryObjMetadata":
             return MemoryObjMetadata.from_dict(d)
         elif t == "NixlRequest":
@@ -216,6 +220,7 @@ class NixlPipe:
                 f"Buffer size must be a multiple of "\
                 f"{NixlPipe.TRANSFER_BUFFER_SIZE}"
 
+        print(f"buffer_device: {nixl_config.buffer_device}")
         torch.cuda.set_device(nixl_config.buffer_device)
         self._buffer = torch.empty(nixl_config.buffer_size,
                                    device=nixl_config.buffer_device,

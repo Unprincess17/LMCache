@@ -70,6 +70,7 @@ class LMCacheEngine:
         memory_allocator: MemoryAllocatorInterface,
         token_database: TokenDatabase,
         gpu_connector: GPUConnectorInterface,
+        layerwise: bool = False,
     ):
         logger.info(f"Creating LMCacheEngine with config: {config}")
         self.config = config
@@ -101,7 +102,7 @@ class LMCacheEngine:
         else:
             self.storage_manager = StorageManager(
                 config, metadata, self.memory_allocator, self.lmcache_worker,
-                self.lookup_server)  # type: ignore[assignment]
+                self.lookup_server, layerwise)  # type: ignore[assignment]
 
         if self.enable_p2p:
             self.distributed_loop = asyncio.get_event_loop()
@@ -445,9 +446,10 @@ class LayerwiseLMCacheEngine(LMCacheEngine):
         memory_allocator: MemoryAllocatorInterface,
         token_database: TokenDatabase,
         layerwise_gpu_connector: GPUConnectorInterface,
+        layerwise: bool = True,
     ):
         super().__init__(config, metadata, memory_allocator, token_database,
-                         layerwise_gpu_connector)
+                         layerwise_gpu_connector, layerwise)
         assert isinstance(self.gpu_connector,
                           VLLMPagedMemLayerwiseGPUConnector)
 
@@ -460,7 +462,17 @@ class LayerwiseLMCacheEngine(LMCacheEngine):
                     mask: Optional[torch.Tensor] = None,
                     **kwargs) -> Generator[None, None, None]:
         """
-        Store the KV cache in a layerwise manner.
+        Store the KV cache in a layerwise manner with bandwidth optimization.
+        
+        This implementation processes one layer at a time in the following order:
+        1. Process all token chunks to get metadata for the entire layer
+        2. Register metadata with storage manager
+        3. Allocate memory and transfer data
+        4. Store in backend
+        5. Move to next layer
+        
+        This approach ensures proper metadata registration before allocation
+        while maintaining bandwidth optimization.
         
         :param torch.Tensor tokens: The tokens of the corresponding KV caches.
         
@@ -479,90 +491,126 @@ class LayerwiseLMCacheEngine(LMCacheEngine):
             storage backends. In the last iteration, it puts the memory objects 
             of the last layer to the storage backends.
         """
-
         if mask is not None:
             num_stored_tokens = torch.sum(mask).item()
         else:
             num_stored_tokens = len(tokens)
         monitor_req_id = self.stats_monitor.on_store_request(num_stored_tokens)
 
-        starts = []
-        ends = []
-        keys = []
-        memory_objs = []
-        kv_dtype = self.metadata.kv_dtype
-        for start, end, key in self.token_database.process_tokens(
-                tokens, mask):
-            assert isinstance(key, CacheEngineKey)
+        # Process tokens to get starts, ends, and base keys
+        token_chunks = list(self.token_database.process_tokens(tokens, mask))
+        if not token_chunks:
+            # If no tokens to process, yield for each layer and return
+            for _ in range(self.num_layers):
+                yield
+            yield
+            return
 
-            keys_multi_layer = key.split_layers(self.num_layers)
+        # Process one layer at a time
+        for layer_id in range(self.num_layers):
+            # First pass: collect metadata for all chunks in this layer
+            layer_metadata = []
+            layer_keys = []
+            layer_chunks = []  # Store (start, end) pairs
+            
+            for start, end, base_key in token_chunks:
+                assert isinstance(base_key, CacheEngineKey)
+                
+                # Create layer-specific key
+                key = base_key.split_layers(self.num_layers)[layer_id]
+                
+                # Skip if already cached
+                if self.storage_manager.contains(key):
+                    continue
+                
+                # Prepare metadata for this chunk
+                num_tokens = end - start
+                kv_shape_single_layer = self.gpu_connector.get_shape(num_tokens)
+                memobj_meta = self.storage_manager.dry_allocate(
+                    kv_shape_single_layer,
+                    self.metadata.kv_dtype,
+                    fmt=MemoryFormat.KV_T2D
+                )
+                
+                if memobj_meta is None:
+                    logger.warning(
+                        f"Failed to prepare metadata for layer {layer_id}, "
+                        f"chunk {start}:{end}")
+                    continue
+                
+                layer_metadata.append(memobj_meta)
+                layer_keys.append(key)
+                layer_chunks.append((start, end))
 
-            # Only check the first layer
-            if self.storage_manager.contains(keys_multi_layer[0]):
+            if not layer_chunks:
+                # No chunks to process in this layer
+                yield
                 continue
 
-            # Allocate the memory object
-            num_tokens = end - start
-            kv_shape_single_layer = self.gpu_connector.get_shape(num_tokens)
+            # Register all metadata for this layer
+            self.storage_manager.prepare_put(layer_keys, layer_metadata)
 
-            # TODO(Jiayi): Optimize with batched allocation
-            memory_objs_multi_layer: List[MemoryObj] = []
-            no_space_left = False
-            for layer_id in range(self.num_layers):
-                mem_obj_single_layer = self.storage_manager.allocate(
-                    kv_shape_single_layer, kv_dtype, fmt=MemoryFormat.KV_T2D)
-
-                if mem_obj_single_layer is None:
+            # Second pass: allocate and transfer data
+            starts = []
+            ends = []
+            memory_objs = []
+            valid_keys = []
+            
+            # allocate memory for each chunk on CPU
+            # TODO: This could be replaced by GDR copy, maybe supported by Nixl?
+            for (start, end), key, meta in zip(layer_chunks, layer_keys, layer_metadata):
+                # Now allocate memory with registered metadata
+                mem_obj = self.storage_manager.allocate(
+                    meta.shape,
+                    meta.dtype,
+                    fmt=meta.fmt
+                )
+                
+                if mem_obj is None:
                     logger.warning(
-                        "Failed to allocate memory for the KV cache.\n"
-                        "The KV cache will not be stored.")
-                    no_space_left = True
-                    for mem_obj_prev_layer in memory_objs_multi_layer:
-                        mem_obj_prev_layer.ref_count_down()
-                    break
+                        f"Failed to allocate memory for layer {layer_id}, "
+                        f"chunk {start}:{end}")
+                    continue
+                
+                starts.append(start)
+                ends.append(end)
+                memory_objs.append(mem_obj)
+                valid_keys.append(key)
+                
+                # Update lookup server for this chunk
+                if self.lookup_server is not None:
+                    self.lookup_server.insert(key)
+            
 
-                memory_objs_multi_layer.append(mem_obj_single_layer)
-
-            if no_space_left:
-                break
-
-            starts.append(start)
-            ends.append(end)
-            keys.append(keys_multi_layer)
-            memory_objs.append(memory_objs_multi_layer)
-
-            # Update lookup server
-            if self.lookup_server is not None:
-                self.lookup_server.batched_insert(keys_multi_layer)
-
-        if keys:
-            # Transpose the keys and memory objects into layer major format
-            memory_objs = [
-                list(row) for row in zip(*memory_objs, strict=False)
-            ]
-            keys = [list(row) for row in zip(*keys, strict=False)]
-
-            assert isinstance(self.gpu_connector,
-                              VLLMPagedMemLayerwiseGPUConnector)
-            mem_obj_generator = self.gpu_connector.batched_from_gpu(
-                memory_objs, starts, ends, **kwargs)
-
-            next(mem_obj_generator)
-
-            for layer_id in range(self.num_layers):
-                yield
-                next(mem_obj_generator)
-                self.storage_manager.batched_put(keys[layer_id],
-                                                 memory_objs[layer_id])
-        else:
-            # If no cache are found, we still need to yield to avoid
-            # `StopIteration`
-            for layer_id in range(self.num_layers):
-                yield
-
+            # batch from gpu, and put to storage manager
+            if memory_objs:
+                # Transfer data for this layer
+                assert isinstance(self.gpu_connector,
+                               VLLMPagedMemLayerwiseGPUConnector)
+                
+                # Create a single-layer generator
+                mem_obj_generator = self.gpu_connector.batched_from_gpu(
+                    [memory_objs],  # Wrap in list since we're doing one layer
+                    starts,
+                    ends,
+                    **kwargs
+                )
+                
+                # Process the generator
+                next(mem_obj_generator)  # Initial setup and transfer data
+                
+                # Store the layer's data in backend
+                self.storage_manager.batched_put(valid_keys, memory_objs)
+                
+                # Commit the put operation
+                self.storage_manager.commit_put()
+            
+            # Yield after processing each layer
+            yield
+        
         self.stats_monitor.on_store_finished(monitor_req_id)
         logger.debug(f"Stored {num_stored_tokens} "
-                     f"out of total {len(tokens)} tokens")
+                    f"out of total {len(tokens)} tokens")
         yield
 
     @_lmcache_nvtx_annotate
@@ -631,11 +679,12 @@ class LayerwiseLMCacheEngine(LMCacheEngine):
                 keys_layer_major)
 
             assert isinstance(self.gpu_connector,
-                              VLLMPagedMemLayerwiseGPUConnector)
+                           VLLMPagedMemLayerwiseGPUConnector)
             mem_obj_consumer = self.gpu_connector.batched_to_gpu(
                 starts, ends, **kwargs)
             next(mem_obj_consumer)
 
+            to_count_down = []
             for layer_id in range(self.num_layers):
 
                 tasks = next(get_generator)
@@ -646,27 +695,30 @@ class LayerwiseLMCacheEngine(LMCacheEngine):
 
                 mem_objs_layer = [task.result() for task in tasks]
                 mem_obj_consumer.send(mem_objs_layer)
+                to_count_down.extend(mem_objs_layer)
 
             # TODO(Jiayi): Need to be done in a modular way
             for keys_layer in keys_layer_major:
                 self.storage_manager.batched_unpin(keys_layer)
+
+            for mem_obj in to_count_down:
+                mem_obj.ref_count_down()
+
+            # Final synchronization
+            yield None
+            next(mem_obj_consumer)  # Wait for last layer
         else:
-            # If no cache are found, we still need to yield to avoid
-            # `StopIteration`
-            for layer_id in range(self.num_layers):
+            # If no cache is found, we still need to yield for each layer
+            # to maintain the generator protocol
+            for _ in range(self.num_layers + 1):
                 yield None
-
-        yield None
-
-        # synchronize the last layer
-        next(mem_obj_consumer)
 
         retrieved_tokens = torch.sum(ret_mask)
         self.stats_monitor.on_retrieve_finished(monitor_req_id,
-                                                retrieved_tokens)
+                                              retrieved_tokens)
         logger.debug(f"Retrieved {retrieved_tokens} "
-                     f"out of {num_required_tokens} "
-                     f"out of total {len(tokens)} tokens")
+                    f"out of {num_required_tokens} "
+                    f"out of total {len(tokens)} tokens")
 
         yield ret_mask
 
@@ -698,9 +750,12 @@ class LayerwiseLMCacheEngine(LMCacheEngine):
             # of one layer
             key_all_layers = key.split_layers(self.num_layers)
             for key_single_layer in key_all_layers:
+                logger.debug(f"Checking key in storage: {key_single_layer}")
                 if not self.storage_manager.contains(key_single_layer,
                                                      search_range, pin):
+                    logger.debug(f"Key not found in storage: {key_single_layer}")
                     return start
+                logger.debug(f"Key found in storage: {key_single_layer}")
         return end
 
 

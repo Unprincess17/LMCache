@@ -149,6 +149,26 @@ class LayerCacheEngineKey(CacheEngineKey):
             raise ValueError(f"Invalid key string: {s}")
         return LayerCacheEngineKey(parts[0], parts[1], int(parts[2]),
                                    int(parts[3]), parts[4], int(parts[5]))
+    
+    def to_dict(self):
+        return {
+            "__type__": "LayerCacheEngineKey",
+            "fmt": self.fmt,
+            "model_name": self.model_name,
+            "world_size": self.world_size,
+            "worker_id": self.worker_id,
+            "chunk_hash": self.chunk_hash,
+            "layer_id": self.layer_id
+        }
+    
+    @staticmethod
+    def from_dict(d):
+        return LayerCacheEngineKey(fmt=d["fmt"],
+                                   model_name=d["model_name"],
+                                   world_size=d["world_size"],
+                                   worker_id=d["worker_id"],
+                                   chunk_hash=d["chunk_hash"],
+                                   layer_id=d["layer_id"])
 
 
 ##### NVTX annotation #####
