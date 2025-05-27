@@ -388,7 +388,31 @@ class NixlBackend(StorageBackendInterface):
         self,
         key: CacheEngineKey,
     ) -> Optional[Future]:
-        raise NotImplementedError
+        """
+        Non-blocking function to get the memory object from the storage backend.
+        
+        :param key: The key of the MemoryObj to retrieve.
+        :return: A Future object that will resolve to the MemoryObj, or None if the key doesn't exist.
+        """
+        if not self.contains(key):
+            return None
+            
+        # Create a Future object to represent the asynchronous operation
+        future = Future()
+        
+        def get_and_set_result():
+            try:
+                # Get the memory object from the object pool
+                result = self._obj_pool.get(key)
+                future.set_result(result)
+            except Exception as e:
+                future.set_exception(e)
+                
+        # Start a new thread to perform the get operation
+        thread = threading.Thread(target=get_and_set_result)
+        thread.start()
+        
+        return future
 
     def remove(self, key: CacheEngineKey) -> None:
         """

@@ -538,14 +538,32 @@ class DistributedStorageManager:
         self,
         keys: Sequence[Sequence[CacheEngineKey]],
     ) -> Generator[List[Future], None, None]:
-        raise NotImplementedError
+        """
+        Non-blocking function to get the memory objects from the storages
+        in a layerwise manner.
+        
+        :param Sequence[Sequence[CacheEngineKey]] keys: The keys to get. The first
+            dimension corresponds to the number of layers, and the second 
+            dimension corresponds to the number of chunks.
+        
+        :return: A generator that yields a list of futures for each layer.
+        """
+        for keys_multi_chunk in keys:
+            # Store all chunks for one layer
+            tasks = []
+            for key in keys_multi_chunk:
+                task = self.storage_backend.get_non_blocking(key)
+                assert task is not None, f"Failed to get task for key {key}"
+                tasks.append(task)
+            yield tasks
 
     def batched_unpin(
         self,
         keys: Sequence[CacheEngineKey],
         locations: Optional[List[str]] = None,
     ) -> None:
-        raise NotImplementedError
+        # Not implemented yet
+        pass
 
     def remove(
         self,

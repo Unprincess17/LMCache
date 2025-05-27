@@ -527,7 +527,7 @@ class LMCacheConnectorV1Impl:
                 slot_mapping = slot_mapping.cuda()
                 # NOTE: In PD setting, lmcache_engine.lookup() will always
                 # return 0 if there is no local storage configured.
-                # In this case, we should rely on the slip_leading_tokens in
+                # In this case, we should rely on the skip_leading_tokens in
                 # save_spec to avoid transmit the already saved tokens again.
                 skip_leading_tokens = max(
                     self.lmcache_engine.lookup(token_ids),

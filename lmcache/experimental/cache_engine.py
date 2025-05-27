@@ -750,12 +750,9 @@ class LayerwiseLMCacheEngine(LMCacheEngine):
             # of one layer
             key_all_layers = key.split_layers(self.num_layers)
             for key_single_layer in key_all_layers:
-                logger.debug(f"Checking key in storage: {key_single_layer}")
                 if not self.storage_manager.contains(key_single_layer,
                                                      search_range, pin):
-                    logger.debug(f"Key not found in storage: {key_single_layer}")
                     return start
-                logger.debug(f"Key found in storage: {key_single_layer}")
         return end
 
 
