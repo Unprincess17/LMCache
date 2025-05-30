@@ -467,7 +467,7 @@ class LayerwiseLMCacheEngine(LMCacheEngine):
         This implementation processes one layer at a time in the following order:
         1. Process all token chunks to get metadata for the entire layer
         2. Register metadata with storage manager
-        3. Allocate memory and transfer data
+        3. Allocate memory and transfer data in batches
         4. Store in backend
         5. Move to next layer
         
@@ -547,63 +547,83 @@ class LayerwiseLMCacheEngine(LMCacheEngine):
                 yield
                 continue
 
-            # Register all metadata for this layer
-            self.storage_manager.prepare_put(layer_keys, layer_metadata)
+            # Process chunks in batches
+            for batch_start in range(0, len(layer_chunks), BATCH_SIZE):
+                batch_end = min(batch_start + BATCH_SIZE, len(layer_chunks))
+                logger.debug(f"Executing batch {batch_start}:{batch_end}")
+                
+                # Get the current batch
+                batch_chunks = layer_chunks[batch_start:batch_end]
+                batch_keys = layer_keys[batch_start:batch_end]
+                batch_metadata = layer_metadata[batch_start:batch_end]
 
-            # Second pass: allocate and transfer data
-            starts = []
-            ends = []
-            memory_objs = []
-            valid_keys = []
-            
-            # allocate memory for each chunk on CPU
-            # TODO: This could be replaced by GDR copy, maybe supported by Nixl?
-            for (start, end), key, meta in zip(layer_chunks, layer_keys, layer_metadata):
-                # Now allocate memory with registered metadata
-                mem_obj = self.storage_manager.allocate(
-                    meta.shape,
-                    meta.dtype,
-                    fmt=meta.fmt
-                )
-                
-                if mem_obj is None:
-                    logger.warning(
-                        f"Failed to allocate memory for layer {layer_id}, "
-                        f"chunk {start}:{end}")
-                    continue
-                
-                starts.append(start)
-                ends.append(end)
-                memory_objs.append(mem_obj)
-                valid_keys.append(key)
-                
-                # Update lookup server for this chunk
-                if self.lookup_server is not None:
-                    self.lookup_server.insert(key)
-            
+                # Register metadata for this batch
+                self.storage_manager.prepare_put(batch_keys, batch_metadata)
 
-            # batch from gpu, and put to storage manager
-            if memory_objs:
-                # Transfer data for this layer
-                assert isinstance(self.gpu_connector,
-                               VLLMPagedMemLayerwiseGPUConnector)
+                # Allocate memory for the batch
+                starts = []
+                ends = []
+                memory_objs = []
+                valid_keys = []
                 
-                # Create a single-layer generator
-                mem_obj_generator = self.gpu_connector.batched_from_gpu(
-                    [memory_objs],  # Wrap in list since we're doing one layer
-                    starts,
-                    ends,
-                    **kwargs
-                )
-                
-                # Process the generator
-                next(mem_obj_generator)  # Initial setup and transfer data
-                
-                # Store the layer's data in backend
-                self.storage_manager.batched_put(valid_keys, memory_objs)
-                
-                # Commit the put operation
-                self.storage_manager.commit_put()
+                for (start, end), key, meta in zip(batch_chunks, batch_keys, batch_metadata):
+                    mem_obj = self.storage_manager.allocate(
+                        meta.shape,
+                        meta.dtype,
+                        fmt=meta.fmt
+                    )
+                    
+                    if mem_obj is None:
+                        logger.warning(
+                            f"Failed to allocate memory for layer {layer_id}, "
+                            f"chunk {start}:{end}")
+                        continue
+                    
+                    starts.append(start)
+                    ends.append(end)
+                    memory_objs.append(mem_obj)
+                    valid_keys.append(key)
+                    
+                    # Update lookup server for this chunk
+                    if self.lookup_server is not None:
+                        self.lookup_server.insert(key)
+
+                if memory_objs:
+                    # Transfer data for this batch
+                    assert isinstance(self.gpu_connector,
+                                   VLLMPagedMemLayerwiseGPUConnector)
+                    
+                    # Create batch-specific kwargs by slicing relevant data
+                    batch_kwargs = kwargs.copy()
+                    if "slot_mapping" in kwargs:
+                        slot_mapping = kwargs["slot_mapping"]
+                        min_start = min(starts)
+                        max_end = max(ends)
+                        batch_kwargs["slot_mapping"] = slot_mapping[min_start:max_end]
+                        
+                        # Adjust starts and ends to be relative to the sliced slot_mapping
+                        relative_starts = [s - min_start for s in starts]
+                        relative_ends = [e - min_start for e in ends]
+                    else:
+                        relative_starts = starts
+                        relative_ends = ends
+                    
+                    # Create a single-layer generator for this batch
+                    mem_obj_generator = self.gpu_connector.batched_from_gpu(
+                        [memory_objs],  # Wrap in list since we're doing one layer
+                        relative_starts,
+                        relative_ends,
+                        **batch_kwargs
+                    )
+                    
+                    # Process the generator
+                    next(mem_obj_generator)  # Initial setup and transfer data
+                    
+                    # Store the batch's data in backend
+                    self.storage_manager.batched_put(valid_keys, memory_objs)
+                    
+                    # Commit the put operation
+                    self.storage_manager.commit_put()
             
             # Yield after processing each layer
             yield
@@ -642,6 +662,7 @@ class LayerwiseLMCacheEngine(LMCacheEngine):
             last iteration, it moves the memory objects of the last layer to
             the GPU.
         """
+        BATCH_SIZE = 32  # Number of chunks to process at once
 
         if mask is not None:
             num_required_tokens = torch.sum(mask).item()
@@ -675,38 +696,66 @@ class LayerwiseLMCacheEngine(LMCacheEngine):
             # Transpose the keys into layer major format
             keys_layer_major = [list(row) for row in zip(*keys, strict=False)]
 
-            get_generator = self.storage_manager.layerwise_batched_get(
-                keys_layer_major)
+            # Process chunks in batches
+            for batch_start in range(0, len(starts), BATCH_SIZE):
+                batch_end = min(batch_start + BATCH_SIZE, len(starts))
+                logger.debug(f"Retrieving batch {batch_start}:{batch_end}")
+                
+                # Get the current batch
+                batch_starts = starts[batch_start:batch_end]
+                batch_ends = ends[batch_start:batch_end]
+                batch_keys_by_layer = [layer_keys[batch_start:batch_end] 
+                                     for layer_keys in keys_layer_major]
 
-            assert isinstance(self.gpu_connector,
-                           VLLMPagedMemLayerwiseGPUConnector)
-            mem_obj_consumer = self.gpu_connector.batched_to_gpu(
-                starts, ends, **kwargs)
-            next(mem_obj_consumer)
+                # Create batch-specific kwargs
+                batch_kwargs = kwargs.copy()
+                if "slot_mapping" in kwargs:
+                    slot_mapping = kwargs["slot_mapping"]
+                    min_start = min(batch_starts)
+                    max_end = max(batch_ends)
+                    batch_kwargs["slot_mapping"] = slot_mapping[min_start:max_end]
+                    
+                    # Adjust starts and ends to be relative to the sliced slot_mapping
+                    relative_starts = [s - min_start for s in batch_starts]
+                    relative_ends = [e - min_start for e in batch_ends]
+                else:
+                    relative_starts = batch_starts
+                    relative_ends = batch_ends
 
-            to_count_down = []
-            for layer_id in range(self.num_layers):
+                # Set up the consumer for this batch
+                assert isinstance(self.gpu_connector,
+                               VLLMPagedMemLayerwiseGPUConnector)
+                mem_obj_consumer = self.gpu_connector.batched_to_gpu(
+                    relative_starts, relative_ends, **batch_kwargs)
+                next(mem_obj_consumer)  # Initial setup
 
-                tasks = next(get_generator)
+                # Process each layer for this batch
+                to_count_down = []
+                for layer_id in range(self.num_layers):
+                    # Get memory objects for current layer
+                    get_generator = self.storage_manager.layerwise_batched_get(
+                        [batch_keys_by_layer[layer_id]])
+                    tasks = next(get_generator)
+                    assert None not in tasks
+                    
+                    yield None  # Allow cooperative multitasking
 
-                assert None not in tasks
+                    # Get results and send to consumer
+                    mem_objs_layer = [task.result() for task in tasks]
+                    mem_obj_consumer.send(mem_objs_layer)
+                    to_count_down.extend(mem_objs_layer)
+                    
+                    # Unpin the current layer's keys
+                    self.storage_manager.batched_unpin(batch_keys_by_layer[layer_id])
+
+                # Final sync for this batch
+                next(mem_obj_consumer)
+                
+                # Clean up memory objects for this batch
+                for mem_obj in to_count_down:
+                    mem_obj.ref_count_down()
 
                 yield None
-
-                mem_objs_layer = [task.result() for task in tasks]
-                mem_obj_consumer.send(mem_objs_layer)
-                to_count_down.extend(mem_objs_layer)
-
-            # TODO(Jiayi): Need to be done in a modular way
-            for keys_layer in keys_layer_major:
-                self.storage_manager.batched_unpin(keys_layer)
-
-            for mem_obj in to_count_down:
-                mem_obj.ref_count_down()
-
-            # Final synchronization
-            yield None
-            next(mem_obj_consumer)  # Wait for last layer
         else:
             # If no cache is found, we still need to yield for each layer
             # to maintain the generator protocol

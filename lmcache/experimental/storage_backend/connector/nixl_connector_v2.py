@@ -83,7 +83,6 @@ class NixlBufferAllocator(MemoryAllocatorInterface):
             self._flush()
 
         # allocate the memory
-        logger.debug(f"Allocating memory for {required_size} bytes at address {self.allocated_size}:{self.allocated_size + required_size}")
         raw_tensor = self.buffer[self.allocated_size : self.allocated_size\
                 + required_size]
         ret = TensorMemoryObj(raw_data=raw_tensor,
