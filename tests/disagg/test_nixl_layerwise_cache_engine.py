@@ -193,7 +193,7 @@ if __name__ == "__main__":
     kv_shape = gpu_connector.get_shape(config.chunk_size)
     element_size = torch.tensor([], dtype=metadata.kv_dtype).element_size()
     chunk_size_bytes = torch.prod(torch.tensor(kv_shape)).item() * element_size
-    total_size = chunk_size_bytes * args.num_chunks
+    total_size = num_layers * chunk_size_bytes * args.num_chunks
 
     # Create the LayerwiseLMCacheEngine
     engine = LMCacheEngineBuilder.get_or_create("test_engine",
@@ -238,14 +238,8 @@ if __name__ == "__main__":
             store_generator = engine.store_layer(tokens,
                                                kvcaches=kv_cache,
                                                slot_mapping=slot_mapping)
-            layer_count = 0
             for _ in store_generator:
                 pass
-                logger.info(f"Stored layer {layer_count}/{num_layers}")
-                layer_count += 1
-                # Verify storage immediately after storing
-                test_count = engine.lookup(tokens) // config.chunk_size
-                logger.info(f"Immediate lookup after store: {test_count}/{args.num_chunks} chunks found")
 
             end_time = time.time()
             elapsed_time = end_time - start_time
@@ -262,7 +256,7 @@ if __name__ == "__main__":
             # Poll until we receive all chunks or timeout
             received_count = 0
             start_time = time.time()
-            timeout = 1200  # seconds
+            timeout = 20  # seconds
 
             while received_count < args.num_chunks:
                 # Check how many chunks we've received by looking up tokens
