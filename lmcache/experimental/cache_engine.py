@@ -447,6 +447,7 @@ class LayerwiseLMCacheEngine(LMCacheEngine):
         token_database: TokenDatabase,
         layerwise_gpu_connector: GPUConnectorInterface,
         layerwise: bool = True,
+        batch_size: int = 32,
     ):
         super().__init__(config, metadata, memory_allocator, token_database,
                          layerwise_gpu_connector, layerwise)
@@ -454,6 +455,7 @@ class LayerwiseLMCacheEngine(LMCacheEngine):
                           VLLMPagedMemLayerwiseGPUConnector)
 
         self.num_layers = metadata.kv_shape[0]
+        self.batch_size = batch_size
 
     @_lmcache_nvtx_annotate
     @torch.inference_mode()
@@ -491,11 +493,12 @@ class LayerwiseLMCacheEngine(LMCacheEngine):
             storage backends. In the last iteration, it puts the memory objects 
             of the last layer to the storage backends.
         """
+        st = time.perf_counter()
         if mask is not None:
-            num_stored_tokens = torch.sum(mask).item()
+            num_tokens = torch.sum(mask).item()
         else:
-            num_stored_tokens = len(tokens)
-        monitor_req_id = self.stats_monitor.on_store_request(num_stored_tokens)
+            num_tokens = len(tokens)
+        monitor_req_id = self.stats_monitor.on_store_request(num_tokens)
 
         # Process tokens to get starts, ends, and base keys
         token_chunks = list(self.token_database.process_tokens(tokens, mask))
@@ -506,26 +509,33 @@ class LayerwiseLMCacheEngine(LMCacheEngine):
             yield
             return
 
+        # Track metrics per layer
+        layerwise_times = []
+        total_offload_time = 0.0
+        total_put_time = 0.0
+        total_kv_size = 0
+
         # Process one layer at a time
         for layer_id in range(self.num_layers):
+            layer_st = time.perf_counter()
             # First pass: collect metadata for all chunks in this layer
-            layer_metadata = []
-            layer_keys = []
-            layer_chunks = []  # Store (start, end) pairs
+            chunk_metadata = []
+            chunk_keys = []
+            chunk_ranges = []  # Store (start, end) pairs
             
             for start, end, base_key in token_chunks:
                 assert isinstance(base_key, CacheEngineKey)
                 
                 # Create layer-specific key
-                key = base_key.split_layers(self.num_layers)[layer_id]
+                keys_multi_layer = base_key.split_layers(self.num_layers)[layer_id]
                 
                 # Skip if already cached
-                if self.storage_manager.contains(key):
+                if self.storage_manager.contains(keys_multi_layer):
                     continue
                 
                 # Prepare metadata for this chunk
-                num_tokens = end - start
-                kv_shape_single_layer = self.gpu_connector.get_shape(num_tokens)
+                num_chunk_tokens = end - start
+                kv_shape_single_layer = self.gpu_connector.get_shape(num_chunk_tokens)
                 memobj_meta = self.storage_manager.dry_allocate(
                     kv_shape_single_layer,
                     self.metadata.kv_dtype,
@@ -538,40 +548,44 @@ class LayerwiseLMCacheEngine(LMCacheEngine):
                         f"chunk {start}:{end}")
                     continue
                 
-                layer_metadata.append(memobj_meta)
-                layer_keys.append(key)
-                layer_chunks.append((start, end))
+                chunk_metadata.append(memobj_meta)
+                chunk_keys.append(keys_multi_layer)
+                chunk_ranges.append((start, end))
 
-            if not layer_chunks:
+            if not chunk_ranges:
                 # No chunks to process in this layer
                 yield
                 continue
 
             # Process chunks in batches
-            for batch_start in range(0, len(layer_chunks), BATCH_SIZE):
-                batch_end = min(batch_start + BATCH_SIZE, len(layer_chunks))
-                logger.debug(f"Executing batch {batch_start}:{batch_end}")
+            for batch_start in range(0, len(chunk_ranges), self.batch_size):
+                batch_end = min(batch_start + self.batch_size, len(chunk_ranges))
+                logger.debug(f"Processing batch {batch_start}:{batch_end}")
                 
                 # Get the current batch
-                batch_chunks = layer_chunks[batch_start:batch_end]
-                batch_keys = layer_keys[batch_start:batch_end]
-                batch_metadata = layer_metadata[batch_start:batch_end]
+                batch_ranges = chunk_ranges[batch_start:batch_end]
+                batch_keys = chunk_keys[batch_start:batch_end]
+                batch_metadata = chunk_metadata[batch_start:batch_end]
 
                 # Register metadata for this batch
+                t = time.perf_counter()
                 self.storage_manager.prepare_put(batch_keys, batch_metadata)
+                total_put_time += time.perf_counter() - t
 
                 # Allocate memory for the batch
-                starts = []
-                ends = []
-                memory_objs = []
-                valid_keys = []
+                batch_starts = []
+                batch_ends = []
+                batch_memory_objs = []
+                batch_valid_keys = []
                 
-                for (start, end), key, meta in zip(batch_chunks, batch_keys, batch_metadata):
+                for (start, end), keys_multi_layer, meta in zip(batch_ranges, batch_keys, batch_metadata):
+                    t = time.perf_counter()
                     mem_obj = self.storage_manager.allocate(
                         meta.shape,
                         meta.dtype,
                         fmt=meta.fmt
                     )
+                    total_put_time += time.perf_counter() - t
                     
                     if mem_obj is None:
                         logger.warning(
@@ -579,16 +593,17 @@ class LayerwiseLMCacheEngine(LMCacheEngine):
                             f"chunk {start}:{end}")
                         continue
                     
-                    starts.append(start)
-                    ends.append(end)
-                    memory_objs.append(mem_obj)
-                    valid_keys.append(key)
+                    batch_starts.append(start)
+                    batch_ends.append(end)
+                    batch_memory_objs.append(mem_obj)
+                    batch_valid_keys.append(keys_multi_layer)
+                    total_kv_size += mem_obj.get_size()
                     
                     # Update lookup server for this chunk
                     if self.lookup_server is not None:
-                        self.lookup_server.insert(key)
+                        self.lookup_server.insert(keys_multi_layer)
 
-                if memory_objs:
+                if batch_memory_objs:
                     # Transfer data for this batch
                     assert isinstance(self.gpu_connector,
                                    VLLMPagedMemLayerwiseGPUConnector)
@@ -597,20 +612,21 @@ class LayerwiseLMCacheEngine(LMCacheEngine):
                     batch_kwargs = kwargs.copy()
                     if "slot_mapping" in kwargs:
                         slot_mapping = kwargs["slot_mapping"]
-                        min_start = min(starts)
-                        max_end = max(ends)
+                        min_start = min(batch_starts)
+                        max_end = max(batch_ends)
                         batch_kwargs["slot_mapping"] = slot_mapping[min_start:max_end]
                         
                         # Adjust starts and ends to be relative to the sliced slot_mapping
-                        relative_starts = [s - min_start for s in starts]
-                        relative_ends = [e - min_start for e in ends]
+                        relative_starts = [s - min_start for s in batch_starts]
+                        relative_ends = [e - min_start for e in batch_ends]
                     else:
-                        relative_starts = starts
-                        relative_ends = ends
+                        relative_starts = batch_starts
+                        relative_ends = batch_ends
                     
                     # Create a single-layer generator for this batch
+                    t = time.perf_counter()
                     mem_obj_generator = self.gpu_connector.batched_from_gpu(
-                        [memory_objs],  # Wrap in list since we're doing one layer
+                        [batch_memory_objs],  # Wrap in list since we're doing one layer
                         relative_starts,
                         relative_ends,
                         **batch_kwargs
@@ -618,18 +634,45 @@ class LayerwiseLMCacheEngine(LMCacheEngine):
                     
                     # Process the generator
                     next(mem_obj_generator)  # Initial setup and transfer data
+                    total_offload_time += time.perf_counter() - t
                     
                     # Store the batch's data in backend
-                    self.storage_manager.batched_put(valid_keys, memory_objs)
+                    t = time.perf_counter()
+                    self.storage_manager.batched_put(batch_valid_keys, batch_memory_objs)
                     
                     # Commit the put operation
                     self.storage_manager.commit_put()
+                    total_put_time += time.perf_counter() - t
+            
+            # Record layer time
+            layer_time = time.perf_counter() - layer_st
+            layerwise_times.append(layer_time)
             
             # Yield after processing each layer
             yield
+
+        # Calculate and print metrics
+        ed = time.perf_counter()
+        total_time = ed - st
+        avg_layer_time = sum(layerwise_times) / len(layerwise_times) if layerwise_times else 0
+        max_layer_time = max(layerwise_times) if layerwise_times else 0
+        min_layer_time = min(layerwise_times) if layerwise_times else 0
         
+        logger.info(
+            "Store %d tokens takes: %.4f ms, throughput: %.4f GB/s; "
+            "layerwise time (avg/max/min): %.4f/%.4f/%.4f ms; "
+            "offload_time: %.4f ms, put_time: %.4f ms", 
+            num_tokens,
+            total_time * 1000, 
+            total_kv_size / total_time / 1024**3,
+            avg_layer_time * 1000,
+            max_layer_time * 1000,
+            min_layer_time * 1000,
+            total_offload_time * 1000, 
+            total_put_time * 1000)
+
         self.stats_monitor.on_store_finished(monitor_req_id)
-        logger.debug(f"Stored {num_stored_tokens} "
+        logger.debug(f"Stored {num_tokens} "
                     f"out of total {len(tokens)} tokens")
         yield
 
@@ -662,50 +705,45 @@ class LayerwiseLMCacheEngine(LMCacheEngine):
             last iteration, it moves the memory objects of the last layer to
             the GPU.
         """
-        BATCH_SIZE = 32  # Number of chunks to process at once
 
         if mask is not None:
-            num_required_tokens = torch.sum(mask).item()
+            num_tokens = torch.sum(mask).item()
         else:
-            num_required_tokens = len(tokens)
-        monitor_req_id = self.stats_monitor.on_retrieve_request(
-            num_required_tokens)
+            num_tokens = len(tokens)
+        monitor_req_id = self.stats_monitor.on_retrieve_request(num_tokens)
 
         ret_mask = torch.zeros_like(tokens, dtype=torch.bool, device="cpu")
 
-        starts = []
-        ends = []
-        keys = []
-        for start, end, key in self.token_database.process_tokens(
-                tokens, mask):
-            assert isinstance(key, CacheEngineKey)
+        # Process tokens to get starts, ends, and base keys
+        token_chunks = list(self.token_database.process_tokens(tokens, mask))
+        chunk_starts = []
+        chunk_ends = []
+        chunk_keys = []
+        for start, end, base_key in token_chunks:
+            assert isinstance(base_key, CacheEngineKey)
 
-            keys_multi_layer = key.split_layers(self.num_layers)
+            keys_multi_layer = base_key.split_layers(self.num_layers)
 
             # NOTE: Only check the first layer
             if not self.storage_manager.contains(keys_multi_layer[0]):
                 break
 
-            starts.append(start)
-            ends.append(end)
-            keys.append(keys_multi_layer)
+            chunk_starts.append(start)
+            chunk_ends.append(end)
+            chunk_keys.append(keys_multi_layer)
 
             ret_mask[start:end] = True
 
-        if keys:
-            # Transpose the keys into layer major format
-            keys_layer_major = [list(row) for row in zip(*keys, strict=False)]
-
+        if chunk_keys:
             # Process chunks in batches
-            for batch_start in range(0, len(starts), BATCH_SIZE):
-                batch_end = min(batch_start + BATCH_SIZE, len(starts))
-                logger.debug(f"Retrieving batch {batch_start}:{batch_end}")
+            for batch_start in range(0, len(chunk_starts), self.batch_size):
+                batch_end = min(batch_start + self.batch_size, len(chunk_starts))
+                logger.debug(f"Processing batch {batch_start}:{batch_end}")
                 
                 # Get the current batch
-                batch_starts = starts[batch_start:batch_end]
-                batch_ends = ends[batch_start:batch_end]
-                batch_keys_by_layer = [layer_keys[batch_start:batch_end] 
-                                     for layer_keys in keys_layer_major]
+                batch_starts = chunk_starts[batch_start:batch_end]
+                batch_ends = chunk_ends[batch_start:batch_end]
+                batch_keys = chunk_keys[batch_start:batch_end]
 
                 # Create batch-specific kwargs
                 batch_kwargs = kwargs.copy()
@@ -730,32 +768,40 @@ class LayerwiseLMCacheEngine(LMCacheEngine):
                 next(mem_obj_consumer)  # Initial setup
 
                 # Process each layer for this batch
-                to_count_down = []
+                batch_memory_objs = []
                 for layer_id in range(self.num_layers):
+                    # Extract keys for current layer from each chunk
+                    layer_keys = [chunk_keys[layer_id] for chunk_keys in batch_keys]
+                    
                     # Get memory objects for current layer
-                    get_generator = self.storage_manager.layerwise_batched_get(
-                        [batch_keys_by_layer[layer_id]])
-                    tasks = next(get_generator)
-                    assert None not in tasks
+                    get_generator = self.storage_manager.layerwise_batched_get([layer_keys])
+                    get_tasks = next(get_generator)
+                    assert None not in get_tasks
                     
                     yield None  # Allow cooperative multitasking
 
                     # Get results and send to consumer
-                    mem_objs_layer = [task.result() for task in tasks]
-                    mem_obj_consumer.send(mem_objs_layer)
-                    to_count_down.extend(mem_objs_layer)
+                    layer_memory_objs = [retrieve_task.result() for retrieve_task in get_tasks]
+                    mem_obj_consumer.send(layer_memory_objs)
+                    batch_memory_objs.extend(layer_memory_objs)
                     
                     # Unpin the current layer's keys
-                    self.storage_manager.batched_unpin(batch_keys_by_layer[layer_id])
+                    self.storage_manager.batched_unpin(layer_keys)
 
                 # Final sync for this batch
                 next(mem_obj_consumer)
                 
                 # Clean up memory objects for this batch
-                for mem_obj in to_count_down:
+                for mem_obj in batch_memory_objs:
                     mem_obj.ref_count_down()
 
                 yield None
+
+            # NOTE (Shufan): 这部分代码是和retrieve里面丢弃当前key的功能对齐的
+            for batch_keys in batch_keys:
+                for layer_keys in batch_keys:
+                    self.storage_manager.remove(layer_keys)
+
         else:
             # If no cache is found, we still need to yield for each layer
             # to maintain the generator protocol
@@ -766,7 +812,7 @@ class LayerwiseLMCacheEngine(LMCacheEngine):
         self.stats_monitor.on_retrieve_finished(monitor_req_id,
                                               retrieved_tokens)
         logger.debug(f"Retrieved {retrieved_tokens} "
-                    f"out of {num_required_tokens} "
+                    f"out of {num_tokens} "
                     f"out of total {len(tokens)} tokens")
 
         yield ret_mask
