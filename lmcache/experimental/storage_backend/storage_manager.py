@@ -526,7 +526,8 @@ class DistributedStorageManager:
     @_lmcache_nvtx_annotate
     def commit_put(self):
         self.storage_backend.flush_put_tasks()
-
+    
+    @_lmcache_nvtx_annotate
     def get(
         self,
         key: CacheEngineKey,
@@ -534,6 +535,7 @@ class DistributedStorageManager:
         obj = self.storage_backend.get_blocking(key)
         return obj
 
+    @_lmcache_nvtx_annotate
     def layerwise_batched_get(
         self,
         keys: Sequence[Sequence[CacheEngineKey]],
@@ -552,7 +554,7 @@ class DistributedStorageManager:
             # Store all chunks for one layer
             tasks = []
             for key in keys_multi_chunk:
-                task = self.storage_backend.get_non_blocking(key)
+                task = self.get(key)
                 assert task is not None, f"Failed to get task for key {key}"
                 tasks.append(task)
             yield tasks

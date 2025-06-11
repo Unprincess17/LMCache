@@ -500,7 +500,7 @@ class LayerwiseLMCacheEngine(LMCacheEngine):
             num_tokens = len(tokens)
         monitor_req_id = self.stats_monitor.on_store_request(num_tokens)
 
-        # Process tokens to get starts, ends, and base keys
+        # Process tokens to get starts, ends, and base keys for each layer
         token_chunks = list(self.token_database.process_tokens(tokens, mask))
         if not token_chunks:
             # If no tokens to process, yield for each layer and return
@@ -513,6 +513,8 @@ class LayerwiseLMCacheEngine(LMCacheEngine):
         layerwise_times = []
         total_offload_time = 0.0
         total_put_time = 0.0
+        total_prepare_time = 0.0
+        total_batch_put_time = 0.0
         total_kv_size = 0
 
         # Process one layer at a time
@@ -570,6 +572,7 @@ class LayerwiseLMCacheEngine(LMCacheEngine):
                 # Register metadata for this batch
                 t = time.perf_counter()
                 self.storage_manager.prepare_put(batch_keys, batch_metadata)
+                total_prepare_time += time.perf_counter() - t
                 total_put_time += time.perf_counter() - t
 
                 # Allocate memory for the batch
@@ -639,7 +642,7 @@ class LayerwiseLMCacheEngine(LMCacheEngine):
                     # Store the batch's data in backend
                     t = time.perf_counter()
                     self.storage_manager.batched_put(batch_valid_keys, batch_memory_objs)
-                    
+                    total_batch_put_time += time.perf_counter() - t
                     # Commit the put operation
                     self.storage_manager.commit_put()
                     total_put_time += time.perf_counter() - t
@@ -650,7 +653,6 @@ class LayerwiseLMCacheEngine(LMCacheEngine):
             
             # Yield after processing each layer
             yield
-
         # Calculate and print metrics
         ed = time.perf_counter()
         total_time = ed - st
@@ -670,6 +672,8 @@ class LayerwiseLMCacheEngine(LMCacheEngine):
             min_layer_time * 1000,
             total_offload_time * 1000, 
             total_put_time * 1000)
+        logger.info(f"total prepare time: {total_prepare_time * 1000} ms; total put time (w/o prepare): {(total_put_time-total_prepare_time) * 1000} ms")
+        logger.info(f"total batch put time: {total_batch_put_time * 1000} ms")
 
         self.stats_monitor.on_store_finished(monitor_req_id)
         logger.debug(f"Stored {num_tokens} "
@@ -849,6 +853,17 @@ class LayerwiseLMCacheEngine(LMCacheEngine):
                                                      search_range, pin):
                     return start
         return end
+
+class LayerAwareLMCacheEngine(LMCacheEngine):
+    """
+    A specialized cache engine, which store the kv cache in a token's kv layer number aware manner.
+
+    Receiver should be aware of which layers of kv cache are received, and which layers of kv cache are needed.
+    This way, it can retrieve the most needed kv cache before all layers of tokens are transferred.
+
+    Currently, the nixl connector transfer kv cache in token level.
+    """
+
 
 
 class LMCacheEngineBuilder:

@@ -30,6 +30,7 @@ from lmcache.experimental.cache_engine import (LayerwiseLMCacheEngine,
                                                LMCacheEngine)
 from lmcache.integration.vllm.vllm_adapter import init_lmcache_engine
 from lmcache.logging import init_logger
+from lmcache.utils import _lmcache_nvtx_annotate
 
 if TYPE_CHECKING:
     from vllm.attention.backends.abstract import AttentionMetadata
@@ -369,7 +370,7 @@ class LMCacheConnectorV1Impl:
     ####################
     # Worker side APIs
     ####################
-
+    @_lmcache_nvtx_annotate
     def start_load_kv(self, forward_context: "ForwardContext",
                       **kwargs) -> None:
         """Start loading the KV cache from the connector buffer to vLLM's 
@@ -395,10 +396,10 @@ class LMCacheConnectorV1Impl:
         kvcaches = list(self.kv_caches.values())
 
         attn_metadata = forward_context.attn_metadata
-        if attn_metadata is None:
-            logger.warning(
-                "In connector.start_load_kv, but the attn_metadata is None")
-            return
+        # if attn_metadata is None:
+        #     logger.warning(
+        #         "In connector.start_load_kv, but the attn_metadata is None")
+        #     return
 
         assert self.lmcache_engine is not None
 
@@ -559,6 +560,7 @@ class LMCacheConnectorV1Impl:
                 next(layerwise_storer)
         self.current_layer += 1
 
+    @_lmcache_nvtx_annotate
     def wait_for_save(self):
         """Blocking until the KV cache is saved to the connector buffer."""
         if self.kv_role == "kv_consumer":
