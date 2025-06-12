@@ -22,7 +22,7 @@ from transformers import AutoTokenizer
 
 from lmcache.config import LMCacheEngineMetadata
 from lmcache.experimental.config import LMCacheEngineConfig
-from lmcache.utils import CacheEngineKey
+from lmcache.utils import CacheEngineKey, LayerCacheEngineKey, _lmcache_nvtx_annotate
 
 
 class TokenDatabase(metaclass=abc.ABCMeta):
@@ -272,3 +272,87 @@ class SegmentTokenDatabase(TokenDatabase):
                 else:
                     yield start_idx, end_idx, self._hash(token_chunk)
             start_idx = end_idx
+
+
+class LayerFirstTokenDataBase(ChunkedTokenDatabase):
+    """
+    This token database is used to convert tokens into layer first cache engine keys.
+    It processes tokens in a layer-first manner, where each layer's tokens are processed
+    separately and returned as a list of (start_idx, end_idx, key) tuples.
+    """
+
+    def __init__(self, config: LMCacheEngineConfig, metadata: LMCacheEngineMetadata):
+        super().__init__(config, metadata)
+        self.num_layers = metadata.num_layers
+
+    def _make_key_by_hash(self, chunk_layer_hash: str, layer_id: Optional[int] = None):
+        """Override to create layer-specific keys"""
+        assert layer_id is not None, "LayerFirstTokenDatabase requires layer_id to be specified"
+        base_key = super()._make_key_by_hash(chunk_layer_hash)
+        return LayerCacheEngineKey(
+            base_key.fmt,
+            base_key.model_name,
+            base_key.world_size,
+            base_key.worker_id,
+            base_key.chunk_hash,
+            layer_id
+        )
+
+    def _hash(self, tokens: Union[torch.Tensor, List[int]], prefix_hash: str, layer_id: Optional[int] = None) -> str:
+        """Override to include layer ID in the hash"""
+        # Get the base hash from parent class
+        base_hash = super()._hash(tokens, prefix_hash)
+        
+        # If layer_id is provided, include it in the hash
+        if layer_id is not None:
+            hasher = hashlib.sha256()
+            hasher.update(base_hash.encode("ascii"))
+            hasher.update(str(layer_id).encode("ascii"))
+            return hasher.hexdigest()
+        
+        return base_hash
+
+    @_lmcache_nvtx_annotate
+    def process_tokens(self, tokens: Union[torch.Tensor, List[int]], mask: Optional[torch.Tensor] = None, make_key: bool = True) -> Iterable[Tuple[int, int, Union[CacheEngineKey, str]]]:
+        """
+        Process the tokens in a layer-first manner.
+        
+        Args:
+            tokens: Input tokens to process
+            mask: Optional mask for the tokens
+            make_key: Whether to create CacheEngineKey or just return hash string
+            
+        Returns:
+            An iterable of (start_idx, end_idx, key) tuples for each layer
+        """
+        if isinstance(tokens, list):
+            tokens = torch.tensor(tokens)
+            
+        # Calculate num_falses once outside the loop
+        num_falses = 0
+        if mask is not None:
+            num_falses = mask.numel() - mask.long().sum().item()
+            
+        # Process tokens in chunks using parent class's chunking
+        token_chunks = self._chunk_tokens(tokens)
+        prefix_hashes = self._prefix_hash(token_chunks)
+        
+        start_idx = 0
+        for chunk_id, prefix_hash in enumerate(prefix_hashes):
+            start_idx = chunk_id * self.chunk_size
+            end_idx = min(start_idx + self.chunk_size, len(tokens))
+            
+            # Skip chunks that are masked out
+            if mask is not None and start_idx < num_falses:
+                continue
+            
+            # For each chunk, create layer-specific keys
+            for layer_id in range(self.num_layers):
+                if make_key:
+                    # Create layer-specific hash including layer ID
+                    layer_hash = self._hash(tokens[start_idx:end_idx], prefix_hash, layer_id)
+                    yield start_idx, end_idx, self._make_key_by_hash(layer_hash, layer_id)
+                else:
+                    # Just return the layer-specific hash
+                    layer_hash = self._hash(tokens[start_idx:end_idx], prefix_hash, layer_id)
+                    yield start_idx, end_idx, layer_hash
