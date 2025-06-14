@@ -553,12 +553,34 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
         offset = starts[0]
         current_stream = torch.cuda.current_stream()
 
-        for layer_id in range(self.num_layers):
+        # Get the number of layers from the first memory objects batch
+        memory_objs_layer = yield
+        num_layers = len(memory_objs_layer)
+        current_stream.wait_stream(self.load_stream)
 
+        # memobj -> gpu_buffer -> kvcaches
+        with torch.cuda.stream(self.load_stream):
+            for start, end, memory_obj in zip(starts,
+                                              ends,
+                                              memory_objs_layer,
+                                              strict=False):
+                assert memory_obj.metadata.fmt == MemoryFormat.KV_T2D
+                tmp_gpu_buffer_obj.tensor[start - offset:end -
+                                          offset].copy_(memory_obj.tensor,
+                                                        non_blocking=True)
+
+            lmc_ops.single_layer_kv_transfer(
+                tmp_gpu_buffer_obj.tensor,
+                kvcaches[0][0],
+                kvcaches[0][1],
+                slot_mapping_full,
+                False,
+            )
+
+        for layer_id in range(1, num_layers):
             memory_objs_layer = yield
             current_stream.wait_stream(self.load_stream)
-            if layer_id > 0:
-                logger.debug(f"Finished loading layer {layer_id-1}")
+            logger.debug(f"Finished loading layer {layer_id-1}")
 
             # memobj -> gpu_buffer -> kvcaches
             with torch.cuda.stream(self.load_stream):
@@ -578,6 +600,7 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
                     slot_mapping_full,
                     False,
                 )
+
         yield
 
         # synchronize the last layer
@@ -606,6 +629,7 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
         :param memory_objs: The memory objects to store the KV cache. The first 
             dimension is the number of layers, and the second dimension is the
             number of memory objects (i.e., number of chunks) for each layer.
+            The number of layers in memory_objs might be different from self.num_layers.
         
         :param starts: The starting indices of the KV cache in the corresponding
             token sequence.
@@ -646,7 +670,9 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
             offset = starts[0]
             current_stream = torch.cuda.current_stream()
 
-            for layer_id in range(self.num_layers):
+            # Use the number of layers from memory_objs instead of self.num_layers
+            num_layers = len(memory_objs)
+            for layer_id in range(num_layers):
                 memory_objs_layer = memory_objs[layer_id]
                 # kvcaches -> gpu_buffer -> memobj
                 with torch.cuda.stream(self.store_stream):

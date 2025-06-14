@@ -1,0 +1,459 @@
+#!/usr/bin/env python3
+"""
+Test LayerAware Cache Engine for Disaggregated Inference
+
+This test demonstrates layer-aware caching where:
+- Sender transmits layers progressively (layer-0, layer-1, etc.)
+- Receiver starts processing as soon as early layers are available
+- Performance is measured for both layer transmission and early processing latency
+"""
+
+import argparse
+import random
+import time
+import threading
+from typing import Dict, List
+
+import numpy as np
+import torch
+from tqdm import tqdm
+
+from lmcache.config import LMCacheEngineMetadata
+from lmcache.experimental.cache_engine import LMCacheEngineBuilder, LayerAwareLMCacheEngine
+from lmcache.experimental.config import LMCacheEngineConfig
+from lmcache.experimental.gpu_connector import VLLMPagedMemGPUConnectorV2, VLLMPagedMemLayerwiseGPUConnector
+from lmcache.experimental.token_database import LayerFirstTokenDataBase
+from lmcache.experimental.memory_management import MixedMemoryAllocator
+from lmcache.logging import init_logger
+
+logger = init_logger(__name__)
+
+
+def generate_test_tokens(num_chunks: int, chunk_size: int) -> torch.Tensor:
+    """Generate test tokens for testing."""
+    return torch.arange(0,
+                        num_chunks * chunk_size,
+                        dtype=torch.long,
+                        device="cuda")
+
+
+def generate_kv_cache_paged_list_tensors(num_blocks,
+                                         device,
+                                         block_size=16,
+                                         dtype=torch.bfloat16):
+    """Generate paged KV cache tensors."""
+    ret = []
+    num_layers = 32
+    num_heads = 8
+    head_size = 128
+    shape = [2, num_blocks, block_size, num_heads, head_size]
+
+    for i in range(num_layers):
+        torch.manual_seed(42 + i)
+        kv = torch.rand(shape, dtype=dtype, device=device)
+        ret.append(kv)
+
+    return ret
+
+
+def fill_kv_cache_with_layer_pattern(kv_cache, slot_mapping, base_pattern=0.8):
+    """Fill KV cache with layer-specific patterns for verification."""
+    for layer_idx, layer_tensor in tqdm(enumerate(kv_cache),
+                                        total=len(kv_cache),
+                                        desc="Filling KV cache"):
+        # Each layer gets a unique pattern value
+        pattern_value = base_pattern + (layer_idx * 0.01)
+        
+        num_blocks = layer_tensor.shape[1]
+        block_size = layer_tensor.shape[2]
+        new_shape = (2, num_blocks * block_size, 8, 128)
+        layer_tensor.reshape(new_shape)[:, slot_mapping, :, :] = pattern_value
+
+    return kv_cache
+
+
+def verify_layer_pattern(kv_cache, slot_mapping, layer_id, base_pattern=0.8, tolerance=0.01):
+    """Verify that a specific layer contains the expected pattern."""
+    expected_pattern = base_pattern + (layer_id * 0.01)
+    layer_tensor = kv_cache[layer_id]
+    
+    num_blocks = layer_tensor.shape[1]
+    block_size = layer_tensor.shape[2]
+    new_shape = (2, num_blocks * block_size, 8, 128)
+    actual_values = layer_tensor.reshape(new_shape)[:, slot_mapping, :, :]
+    
+    mean_value = actual_values.mean().item()
+    is_correct = abs(mean_value - expected_pattern) <= tolerance
+    
+    logger.debug(f"Layer {layer_id} verification: expected={expected_pattern:.3f}, "
+                f"actual={mean_value:.3f}, correct={is_correct}")
+    
+    return is_correct
+
+
+def calculate_throughput(total_bytes: int, elapsed_time: float) -> float:
+    """Calculate throughput in GB/s."""
+    if elapsed_time == 0:
+        return float('inf')
+    gb = total_bytes / (1024 * 1024 * 1024)
+    return gb / elapsed_time
+
+
+def create_config(role: str, host: str, port: int) -> LMCacheEngineConfig:
+    """Create LayerAware-compatible configuration."""
+    config = LMCacheEngineConfig.from_defaults(
+        chunk_size=256,
+        local_cpu=False,
+        max_local_cpu_size=0,
+        local_disk=None,
+        max_local_disk_size=0,
+        remote_url=None,
+        remote_serde=None,
+        save_decode_cache=False,
+        enable_p2p=False,
+        enable_nixl=True,
+        nixl_role=role,
+        nixl_receiver_host=host,
+        nixl_receiver_port=port,
+        nixl_buffer_size=2**30,  # 1GB
+        nixl_buffer_device='cuda',
+    )
+    return config
+
+
+def create_metadata() -> LMCacheEngineMetadata:
+    """Create metadata with layer information."""
+    chunk_size = 256
+    num_layers = 32
+    num_heads = 32
+    head_dim = 128
+    kv_shape = (num_layers, 2, chunk_size, num_heads, head_dim)
+
+    return LMCacheEngineMetadata(
+        model_name="test_layer_aware_model",
+        world_size=1,
+        worker_id=0,
+        fmt="vllm",
+        kv_dtype=torch.bfloat16,
+        kv_shape=kv_shape,
+    )
+
+
+def create_layer_aware_engine(config: LMCacheEngineConfig, 
+                            metadata: LMCacheEngineMetadata) -> LayerAwareLMCacheEngine:
+    """Create LayerAware Cache Engine with proper components."""
+    # Create LayerFirst token database
+    token_database = LayerFirstTokenDataBase(config, metadata)
+    
+    # Create memory allocator
+    memory_allocator = MixedMemoryAllocator(int(2 * 1024**3))  # 2GB
+    
+    # Create GPU connector
+    hidden_dim = 1024
+    gpu_connector = VLLMPagedMemLayerwiseGPUConnector(
+        hidden_dim,
+        metadata.kv_shape[0],
+        use_gpu=True,
+        chunk_size=config.chunk_size,
+        dtype=metadata.kv_dtype,
+        device="cuda"
+    )
+    
+    # Create LayerAware cache engine
+    engine = LayerAwareLMCacheEngine(
+        config=config,
+        metadata=metadata,
+        memory_allocator=memory_allocator,
+        token_database=token_database,
+        gpu_connector=gpu_connector
+    )
+    
+    return engine
+
+
+class LayerPerformanceTracker:
+    """Track layer-specific performance metrics."""
+    
+    def __init__(self, num_layers: int):
+        self.num_layers = num_layers
+        self.layer_times = {}
+        self.layer_ready_times = {}
+        self.first_layer_latency = None
+        self.total_completion_time = None
+        
+    def record_layer_ready(self, layer_id: int, timestamp: float):
+        """Record when a layer becomes ready."""
+        self.layer_ready_times[layer_id] = timestamp
+        
+    def record_layer_processed(self, layer_id: int, process_time: float):
+        """Record layer processing time."""
+        self.layer_times[layer_id] = process_time
+        
+    def get_metrics(self) -> Dict:
+        """Get comprehensive performance metrics."""
+        if not self.layer_ready_times:
+            return {"status": "no_data"}
+            
+        first_ready = min(self.layer_ready_times.values())
+        last_ready = max(self.layer_ready_times.values())
+        
+        # Calculate first layer latency (time to first layer ready)
+        self.first_layer_latency = first_ready
+        
+        # Calculate total completion time
+        self.total_completion_time = last_ready - first_ready
+        
+        # Calculate processing efficiency
+        total_process_time = sum(self.layer_times.values()) if self.layer_times else 0
+        
+        return {
+            "first_layer_latency_ms": self.first_layer_latency * 1000,
+            "total_completion_time_ms": self.total_completion_time * 1000,
+            "layers_ready": len(self.layer_ready_times),
+            "layers_processed": len(self.layer_times),
+            "total_process_time_ms": total_process_time * 1000,
+            "avg_time_per_layer_ms": total_process_time / len(self.layer_times) * 1000 if self.layer_times else 0,
+            "layer_ready_times": {k: v * 1000 for k, v in self.layer_ready_times.items()},
+            "layer_process_times": {k: v * 1000 for k, v in self.layer_times.items()}
+        }
+
+
+def run_sender(args, config, metadata, tokens, kv_cache, slot_mapping, engine):
+    """Run sender logic with progressive layer transmission."""
+    
+    # Calculate data size for throughput measurement
+    kv_shape = engine.gpu_connector.get_shape(config.chunk_size)
+    element_size = torch.tensor([], dtype=metadata.kv_dtype).element_size()
+    chunk_size_bytes = torch.prod(torch.tensor(kv_shape)).item() * element_size
+    total_size = chunk_size_bytes * args.num_chunks * metadata.kv_shape[0]
+     
+    logger.info(f"📡 SENDER: Starting progressive layer transmission for "
+               f"{len(tokens)} tokens ({args.num_chunks} chunks, {metadata.kv_shape[0]} layers)")
+    
+    start_time = time.time()
+    
+    # Use progressive layer storage - this will send layers in layer-first order
+    engine.store_progressive_layers(
+        tokens=tokens,
+        notify_readiness=True,
+        kvcaches=kv_cache,
+        slot_mapping=slot_mapping
+    )
+    
+    end_time = time.time()
+    elapsed_time = end_time - start_time
+    
+    logger.info(f"✅ SENDER: Completed progressive transmission in {elapsed_time:.3f}s")
+    throughput = calculate_throughput(total_size, elapsed_time)
+    logger.info(f"📊 SENDER: Throughput: {throughput:.2f} GB/s")
+    
+    # Get layer readiness statistics
+    status = engine.get_layer_readiness_status()
+    logger.info(f"📈 SENDER: Transfer statistics:")
+    logger.info(f"   Ready layers: {status['ready_layers']}")
+    logger.info(f"   Progress: {status['transfer_progress']['progress_percent']:.1f}%")
+    logger.info(f"   Transfer rate: {status['transfer_progress']['layers_per_second']:.2f} layers/sec")
+    
+    # Cleanup
+    engine.close()
+    return throughput
+
+
+def run_receiver(args, config, metadata, tokens, retrieved_cache, slot_mapping, engine):
+    """Run receiver logic with early layer processing."""
+    
+    perf_tracker = LayerPerformanceTracker(metadata.kv_shape[0])
+    verification_results = {}
+    
+    logger.info("⏳ RECEIVER: Waiting for early layers...")
+    
+    # Strategy 1: Wait for first layer with timeout
+    start_time = time.time()
+    early_layers = engine.wait_for_early_layers(num_layers=1, timeout_us=60000000)  # 60s timeout
+    
+    if not early_layers:
+        logger.error("❌ RECEIVER: Timeout waiting for early layers")
+        engine.close()
+        return None
+    
+    first_layer_time = time.time() - start_time
+    perf_tracker.record_layer_ready(early_layers[0], first_layer_time)
+    
+    logger.info(f"⚡ RECEIVER: First layer {early_layers[0]} ready in {first_layer_time*1000:.2f}ms! Starting early processing...")
+    
+    # Strategy 2: Process layers progressively as they become ready
+    processed_layers = []
+    
+    for target_layer in range(metadata.kv_shape[0]):
+        layer_start = time.time()
+        
+        # Wait for this specific layer to be ready
+        if engine.layer_status.wait_for_layer_busy(target_layer, timeout_us=10000000):  # 10s timeout per layer
+            layer_ready_time = time.time() - start_time
+            perf_tracker.record_layer_ready(target_layer, layer_ready_time)
+            
+            # Retrieve layer data immediately
+            ret_mask = engine.retrieve_layer_when_ready(
+                layer_id=target_layer,
+                tokens=tokens,
+                timeout_us=500000,  # 500ms timeout since we know it's ready
+                kvcaches=retrieved_cache,
+                slot_mapping=slot_mapping
+            )
+            
+            if ret_mask is not None:
+                retrieved_tokens = torch.sum(ret_mask).item()
+                layer_process_time = time.time() - layer_start
+                perf_tracker.record_layer_processed(target_layer, layer_process_time)
+                
+                # Verify the layer data
+                if verify_layer_pattern(retrieved_cache, slot_mapping, target_layer):
+                    verification_results[target_layer] = "✅ PASS"
+                else:
+                    verification_results[target_layer] = "❌ FAIL"
+                
+                processed_layers.append(target_layer)
+                logger.info(f"   ✨ Layer {target_layer}: {retrieved_tokens} tokens in "
+                           f"{layer_process_time*1000:.2f}ms {verification_results[target_layer]}")
+            else:
+                logger.warning(f"   ⚠️ Layer {target_layer}: Failed to retrieve data")
+                break
+        else:
+            logger.warning(f"   ⏰ Layer {target_layer}: Timeout waiting for readiness")
+            break
+    
+    total_time = time.time() - start_time
+    
+    # Performance analysis
+    metrics = perf_tracker.get_metrics()
+    
+    logger.info(f"\n📊 RECEIVER: Performance Analysis")
+    logger.info(f"   Processed layers: {len(processed_layers)}/{metadata.kv_shape[0]}")
+    logger.info(f"   First layer latency: {metrics['first_layer_latency_ms']:.2f}ms")
+    logger.info(f"   Total completion time: {total_time*1000:.2f}ms")
+    logger.info(f"   Average time per layer: {metrics['avg_time_per_layer_ms']:.2f}ms")
+    
+    # Verification summary
+    passed = sum(1 for r in verification_results.values() if "PASS" in r)
+    logger.info(f"   Data verification: {passed}/{len(verification_results)} layers passed")
+    
+    # Calculate latency benefit vs sequential processing
+    if len(processed_layers) > 1:
+        sequential_time = metrics['avg_time_per_layer_ms'] * len(processed_layers)
+        parallel_benefit = ((sequential_time - total_time*1000) / sequential_time) * 100
+        logger.info(f"   Latency benefit vs sequential: {parallel_benefit:.1f}%")
+    
+    # Cleanup
+    engine.close()
+    
+    return {
+        "processed_layers": len(processed_layers),
+        "first_layer_latency_ms": metrics['first_layer_latency_ms'],
+        "total_time_ms": total_time * 1000,
+        "avg_time_per_layer_ms": metrics['avg_time_per_layer_ms'],
+        "verification_passed": passed,
+        "verification_total": len(verification_results)
+    }
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description='Test LayerAware Cache Engine for Disaggregated Inference')
+    parser.add_argument('--role',
+                        type=str,
+                        required=True,
+                        choices=['sender', 'receiver'],
+                        help='Role of this instance')
+    parser.add_argument('--host',
+                        type=str,
+                        default='localhost',
+                        help='Host name/IP for connection')
+    parser.add_argument('--port',
+                        type=int,
+                        default=5555,
+                        help='Port number for connection')
+    parser.add_argument('--num-chunks',
+                        type=int,
+                        default=8,
+                        help='Number of chunks to send')
+    parser.add_argument('--num-rounds',
+                        type=int,
+                        default=1,
+                        help='Number of rounds to run')
+    
+    args = parser.parse_args()
+    
+    # Set random seeds for reproducibility
+    random.seed(42)
+    torch.manual_seed(42)
+    np.random.seed(42)
+    
+    # Create configuration and metadata
+    config = create_config(args.role, args.host, args.port)
+    metadata = create_metadata()
+
+    # Setup test data
+    num_blocks = 10000
+    block_size = 16
+    dtype = torch.bfloat16
+    device = "cuda"
+    
+    max_chunks = num_blocks * block_size // config.chunk_size
+    assert args.num_chunks <= max_chunks, f"Max chunks: {max_chunks}"
+    
+    # Generate test data (reused across rounds)
+    tokens = generate_test_tokens(args.num_chunks, config.chunk_size)
+    slot_indices = list(range(0, num_blocks * block_size))
+    random.shuffle(slot_indices)
+    slot_mapping = torch.tensor(slot_indices[:len(tokens)], device=device)
+    
+    # Create the LayerAwareLMCacheEngine
+    engine = create_layer_aware_engine(config, metadata)
+
+    if args.role == "sender":
+        kv_cache = generate_kv_cache_paged_list_tensors(num_blocks, device, block_size, dtype)
+        kv_cache = fill_kv_cache_with_layer_pattern(kv_cache, slot_mapping)
+    else:
+        retrieved_cache = generate_kv_cache_paged_list_tensors(num_blocks, device, block_size, dtype)
+    
+    # Run test rounds
+    results = []
+    
+    for round_num in range(args.num_rounds):
+        logger.info(f"\n{'='*80}")
+        logger.info(f"🏁 ROUND {round_num + 1}/{args.num_rounds}")
+        logger.info(f"{'='*80}")
+        
+        if args.role == "sender":
+            result = run_sender(args, config, metadata, tokens, kv_cache, slot_mapping, engine)
+            results.append({"throughput_gb_s": result})
+            
+        else:  # receiver
+            result = run_receiver(args, config, metadata, tokens, retrieved_cache, slot_mapping, engine)
+            if result:
+                results.append(result)
+        
+        # Wait between rounds
+        if round_num < args.num_rounds - 1:
+            time.sleep(2)
+    
+    # Print summary
+    if results:
+        logger.info(f"\n{'='*80}")
+        logger.info("📈 SUMMARY STATISTICS")
+        logger.info(f"{'='*80}")
+        
+        if args.role == "sender":
+            throughputs = [r["throughput_gb_s"] for r in results]
+            logger.info(f"Mean throughput: {np.mean(throughputs):.2f} ± {np.std(throughputs):.2f} GB/s")
+            logger.info(f"Min/Max throughput: {min(throughputs):.2f} / {max(throughputs):.2f} GB/s")
+            
+        else:  # receiver
+            first_latencies = [r["first_layer_latency_ms"] for r in results]
+            total_times = [r["total_time_ms"] for r in results]
+            
+            logger.info(f"Mean first layer latency: {np.mean(first_latencies):.2f} ± {np.std(first_latencies):.2f} ms")
+            logger.info(f"Mean total completion time: {np.mean(total_times):.2f} ± {np.std(total_times):.2f} ms")
+            logger.info(f"Mean verification success rate: {np.mean([r['verification_passed']/r['verification_total'] for r in results])*100:.1f}%")
+    
+    logger.info("🎉 Test completed!") 

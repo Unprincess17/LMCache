@@ -283,7 +283,7 @@ class LayerFirstTokenDataBase(ChunkedTokenDatabase):
 
     def __init__(self, config: LMCacheEngineConfig, metadata: LMCacheEngineMetadata):
         super().__init__(config, metadata)
-        self.num_layers = metadata.num_layers
+        self.num_layers = metadata.kv_shape[0]
 
     def _make_key_by_hash(self, chunk_layer_hash: str, layer_id: Optional[int] = None):
         """Override to create layer-specific keys"""
