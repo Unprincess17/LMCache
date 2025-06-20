@@ -771,6 +771,11 @@ class NixlReceiver:
         """
         self._observers.append(observer)
 
+    def unregister_receive_observer(self, observer: NixlObserverInterface):
+        """Unregister a receive observer"""
+        if observer in self._observers:
+            self._observers.remove(observer)
+
     def close(self):
         """Close the receiver resources."""
         self._running = False
@@ -906,6 +911,11 @@ class NixlChannel:
         """Register a new receive observer"""
         receiver = self._check_receiver()
         receiver.register_receive_observer(observer)
+
+    def unregister_receive_observer(self, observer: NixlObserverInterface):
+        """Unregister a receive observer"""
+        receiver = self._check_receiver()
+        receiver.unregister_receive_observer(observer)
 
     def close(self):
         """Close all resources."""

@@ -472,8 +472,11 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
             assert "device" in kwargs, \
                     "device should be provided to create a GPU buffer."
 
-            # FIXME (Jiayi): Please remove this hardcode
             max_tokens = 32000
+            max_tokens = kwargs.get("max_tokens", 32000)
+            logger.info(
+                f"Using max_tokens={max_tokens} for VLLMPagedMemLayerwiseGPUConnector"
+            )
             shape = self.get_shape(max_tokens)
             self.dtype = kwargs["dtype"]
             self.device = kwargs["device"]
@@ -485,6 +488,7 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
             gpu_buffer_size = num_elements * element_size
             self.gpu_buffer_allocator = GPUMemoryAllocator(gpu_buffer_size,
                                                            device=self.device)
+            logger.info(f"GPU buffer size: {gpu_buffer_size / 1024**3} GB")
 
             self.load_stream = torch.cuda.Stream()
             self.store_stream = torch.cuda.Stream()
@@ -584,6 +588,7 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
 
             # memobj -> gpu_buffer -> kvcaches
             with torch.cuda.stream(self.load_stream):
+                print(len(starts), len(ends), len(memory_objs_layer))
                 for start, end, memory_obj in zip(starts,
                                                   ends,
                                                   memory_objs_layer,
@@ -611,6 +616,180 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
 
         logger.debug(f"Finished loading layer {layer_id}")
         yield
+
+    @_lmcache_nvtx_annotate
+    def to_gpu_single_layer(self, memory_objs: List[MemoryObj],
+                           starts: List[int], ends: List[int], 
+                           layer_id: int, **kwargs):
+        """
+        Transfer all chunks of a single layer from memory objects to GPU KV cache.
+        
+        This method is optimized for single-layer operations and avoids the complexity
+        of the generator pattern used in batched_to_gpu.
+        
+        Args:
+            memory_objs: List of memory objects containing chunks of one layer
+            starts: Starting indices for each chunk in the token sequence
+            ends: Ending indices for each chunk in the token sequence  
+            layer_id: The layer ID to transfer data to
+            **kwargs: Additional arguments including 'kvcaches' and 'slot_mapping'
+            
+        Raises:
+            ValueError: If 'kvcaches' or 'slot_mapping' not provided in kwargs
+        """
+        if "kvcaches" not in kwargs:
+            raise ValueError("'kvcaches' should be provided in kwargs.")
+
+        if "slot_mapping" not in kwargs:
+            raise ValueError("'slot_mapping' should be provided in kwargs.")
+
+        kvcaches: List[torch.Tensor] = kwargs["kvcaches"]
+        slot_mapping: torch.Tensor = kwargs["slot_mapping"]
+        
+        # Validate layer_id
+        if layer_id >= len(kvcaches):
+            raise ValueError(f"layer_id {layer_id} exceeds available layers {len(kvcaches)}")
+        
+        # Build slot mapping for all chunks
+        slot_mapping_chunks = []
+        for start, end in zip(starts, ends, strict=False):
+            slot_mapping_chunks.append(slot_mapping[start:end])
+        
+        slot_mapping_full = torch.cat(slot_mapping_chunks, dim=0)
+        
+        # Allocate GPU buffer for this transfer
+        num_tokens = len(slot_mapping_full)
+        buffer_shape = self.get_shape(num_tokens)
+        tmp_gpu_buffer_obj = self.gpu_buffer_allocator.allocate(
+            buffer_shape, self.dtype, MemoryFormat.KV_T2D)
+        
+        if tmp_gpu_buffer_obj is None:
+            raise RuntimeError("Failed to allocate GPU buffer in GPUConnector")
+        
+        assert tmp_gpu_buffer_obj.tensor is not None
+        
+        offset = starts[0] if starts else 0
+        
+        try:
+            # Copy memory objects to GPU buffer
+            # Use load_stream for consistency with batched_to_gpu
+            with torch.cuda.stream(self.load_stream):
+                for start, end, memory_obj in zip(starts, ends, memory_objs, strict=False):
+                    assert memory_obj.metadata.fmt == MemoryFormat.KV_T2D, \
+                        f"Expected KV_T2D format, got {memory_obj.metadata.fmt}"
+                    assert memory_obj.tensor is not None, \
+                        "Memory object tensor is None"
+                    
+                    # Copy this chunk to the appropriate position in GPU buffer
+                    buffer_start = start - offset
+                    buffer_end = end - offset
+                    tmp_gpu_buffer_obj.tensor[buffer_start:buffer_end].copy_(
+                        memory_obj.tensor, non_blocking=True)
+                
+                # Transfer from GPU buffer to target layer KV cache
+                lmc_ops.single_layer_kv_transfer(
+                    tmp_gpu_buffer_obj.tensor,
+                    kvcaches[layer_id][0],  # K cache for this layer
+                    kvcaches[layer_id][1],  # V cache for this layer
+                    slot_mapping_full,
+                    False,  # False = LMCache to PagedBuffer direction
+                )
+            
+            # Synchronize to ensure transfer completes
+            self.load_stream.synchronize()
+            
+        finally:
+            # Always free the buffer, even if an exception occurred
+            tmp_gpu_buffer_obj.ref_count_down()
+        
+        logger.debug(f"Transferred {len(memory_objs)} chunks to GPU for layer {layer_id}")
+
+    @_lmcache_nvtx_annotate
+    def from_gpu_single_layer(self, memory_objs: List[MemoryObj],
+                             starts: List[int], ends: List[int], 
+                             layer_id: int, **kwargs):
+        """
+        Transfer all chunks of a single layer from GPU KV cache to memory objects.
+        
+        This method is optimized for single-layer operations and avoids the complexity
+        of the generator pattern used in batched_from_gpu.
+        
+        Args:
+            memory_objs: List of memory objects to store chunks of one layer
+            starts: Starting indices for each chunk in the token sequence
+            ends: Ending indices for each chunk in the token sequence  
+            layer_id: The layer ID to transfer data from
+            **kwargs: Additional arguments including 'kvcaches' and 'slot_mapping'
+            
+        Raises:
+            ValueError: If 'kvcaches' or 'slot_mapping' not provided in kwargs
+        """
+        if "kvcaches" not in kwargs:
+            raise ValueError("'kvcaches' should be provided in kwargs.")
+
+        if "slot_mapping" not in kwargs:
+            raise ValueError("'slot_mapping' should be provided in kwargs.")
+
+        kvcaches: List[torch.Tensor] = kwargs["kvcaches"]
+        slot_mapping: torch.Tensor = kwargs["slot_mapping"]
+        
+        # Validate layer_id
+        if layer_id >= len(kvcaches):
+            raise ValueError(f"layer_id {layer_id} exceeds available layers {len(kvcaches)}")
+        
+        # Build slot mapping for all chunks
+        slot_mapping_chunks = []
+        for start, end in zip(starts, ends, strict=False):
+            slot_mapping_chunks.append(slot_mapping[start:end])
+        
+        slot_mapping_full = torch.cat(slot_mapping_chunks, dim=0)
+        
+        # Allocate GPU buffer for this transfer
+        num_tokens = len(slot_mapping_full)
+        buffer_shape = self.get_shape(num_tokens)
+        tmp_gpu_buffer_obj = self.gpu_buffer_allocator.allocate(
+            buffer_shape, self.dtype, MemoryFormat.KV_T2D)
+        
+        if tmp_gpu_buffer_obj is None:
+            raise RuntimeError("Failed to allocate GPU buffer in GPUConnector")
+        
+        assert tmp_gpu_buffer_obj.tensor is not None
+        
+        offset = starts[0] if starts else 0
+        
+        try:
+            # Transfer from GPU KV cache to buffer, then to memory objects
+            # Use store_stream for consistency with batched_from_gpu
+            with torch.cuda.stream(self.store_stream):
+                # Transfer from paged GPU memory to linear buffer
+                lmc_ops.single_layer_kv_transfer(
+                    tmp_gpu_buffer_obj.tensor,
+                    kvcaches[layer_id][0],  # K cache for this layer
+                    kvcaches[layer_id][1],  # V cache for this layer
+                    slot_mapping_full,
+                    True,  # True = PagedBuffer to LMCache direction
+                )
+                
+                # Copy from GPU buffer to memory objects
+                for start, end, memory_obj in zip(starts, ends, memory_objs, strict=False):
+                    assert memory_obj.tensor is not None, \
+                        "Memory object tensor is None"
+                    
+                    # Copy this chunk from the appropriate position in GPU buffer
+                    buffer_start = start - offset
+                    buffer_end = end - offset
+                    memory_obj.tensor.copy_(
+                        tmp_gpu_buffer_obj.tensor[buffer_start:buffer_end],
+                        non_blocking=True)
+            
+            # Synchronize to ensure all transfers complete
+            self.store_stream.synchronize()
+            
+        finally:
+            # Always free the buffer, even if an exception occurred
+            tmp_gpu_buffer_obj.ref_count_down()
+        
+        logger.debug(f"Transferred {len(memory_objs)} chunks from GPU layer {layer_id}")
 
     @_lmcache_nvtx_annotate
     def batched_from_gpu(self, memory_objs: List[List[MemoryObj]],
@@ -693,9 +872,10 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
                             tmp_gpu_buffer_obj.tensor[start - offset:end - offset],
                             non_blocking=True)
 
-                yield
+                # Synchronize to ensure this layer's data is fully copied before yielding
                 self.store_stream.synchronize()
                 logger.debug(f"Finished offloading layer {layer_id}")
+                yield
 
             yield
         finally:
