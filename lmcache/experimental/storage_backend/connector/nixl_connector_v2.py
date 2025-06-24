@@ -518,6 +518,8 @@ class NixlSender:
         """Dry allocate the memory and return the metadata."""
         return self._pipe._allocator.dry_allocate(shape, dtype, fmt)
 
+    @_lmcache_nvtx_annotate
+    @torch.inference_mode()
     def prepare_send(self, keys: list[CacheEngineKey],
                      metadatas: list[MemoryObjMetadata]):
         """Prepare a send transaction by sending the request using 

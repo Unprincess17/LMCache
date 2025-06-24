@@ -68,7 +68,7 @@ def fill_kv_cache_with_layer_pattern(kv_cache, slot_mapping, base_pattern=0.8):
         block_size = layer_tensor.shape[2]
         new_shape = (2, num_blocks * block_size, 8, 128)
         layer_tensor.reshape(new_shape)[:, slot_mapping, :, :] = pattern_value
-        logger.info(f"Layer {layer_idx} value: {layer_tensor.reshape(new_shape)[:, slot_mapping, :, :].mean().item()}")
+
     return kv_cache
 
 
@@ -604,6 +604,7 @@ if __name__ == "__main__":
     
     # Create configuration and metadata
     config = create_config(args.role, args.host, args.port)
+    config.nixl_enable_gc = True
     metadata = create_metadata()
 
     # Setup test data

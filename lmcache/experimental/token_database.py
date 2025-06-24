@@ -22,7 +22,7 @@ from transformers import AutoTokenizer
 
 from lmcache.config import LMCacheEngineMetadata
 from lmcache.experimental.config import LMCacheEngineConfig
-from lmcache.utils import CacheEngineKey, LayerCacheEngineKey, _lmcache_nvtx_annotate
+from lmcache.utils import CacheEngineKey, LayerCacheEngineKey, NVTXContext, _lmcache_nvtx_annotate
 
 
 class TokenDatabase(metaclass=abc.ABCMeta):
@@ -312,7 +312,60 @@ class LayerFirstTokenDataBase(ChunkedTokenDatabase):
         
         return base_hash
 
-    @_lmcache_nvtx_annotate
+    def process_tokens_for_layer(
+        self, 
+        tokens: Union[torch.Tensor, List[int]], 
+        layer_id: int,
+        mask: Optional[torch.Tensor] = None, 
+        make_key: bool = True
+    ) -> Iterable[Tuple[int, int, Union[CacheEngineKey, str]]]:
+        """
+        Process tokens for a specific layer only, avoiding unnecessary computation.
+        
+        This is more efficient than process_tokens when only one layer is needed,
+        as it avoids processing tokens for all layers.
+        
+        Args:
+            tokens: Input tokens to process
+            layer_id: Specific layer ID to process
+            mask: Optional mask for the tokens
+            make_key: Whether to create CacheEngineKey or just return hash string
+            
+        Returns:
+            An iterable of (start_idx, end_idx, key) tuples for the specified layer only
+        """
+        if isinstance(tokens, list):
+            tokens = torch.tensor(tokens)
+            
+        # Calculate num_falses once outside the loop
+        num_falses = 0
+        if mask is not None:
+            num_falses = mask.numel() - mask.long().sum().item()
+            
+        with NVTXContext("token_sub_processing_setup"):
+            # Process tokens in chunks using parent class's chunking
+            token_chunks = self._chunk_tokens(tokens)
+            prefix_hashes = self._prefix_hash(token_chunks)
+        
+        start_idx = 0
+        for chunk_id, prefix_hash in enumerate(prefix_hashes):
+            start_idx = chunk_id * self.chunk_size
+            end_idx = min(start_idx + self.chunk_size, len(tokens))
+            
+            # Skip chunks that are masked out
+            if mask is not None and start_idx < num_falses:
+                continue
+            
+            # Process only the specified layer instead of all layers
+            if make_key:
+                # Create layer-specific hash including layer ID
+                layer_hash = self._hash(tokens[start_idx:end_idx], prefix_hash, layer_id)
+                yield start_idx, end_idx, self._make_key_by_hash(layer_hash, layer_id)
+            else:
+                # Just return the layer-specific hash
+                layer_hash = self._hash(tokens[start_idx:end_idx], prefix_hash, layer_id)
+                yield start_idx, end_idx, layer_hash
+
     def process_tokens(self, tokens: Union[torch.Tensor, List[int]], mask: Optional[torch.Tensor] = None, make_key: bool = True) -> Iterable[Tuple[int, int, Union[CacheEngineKey, str]]]:
         """
         Process the tokens in a layer-first manner.
@@ -333,9 +386,10 @@ class LayerFirstTokenDataBase(ChunkedTokenDatabase):
         if mask is not None:
             num_falses = mask.numel() - mask.long().sum().item()
             
-        # Process tokens in chunks using parent class's chunking
-        token_chunks = self._chunk_tokens(tokens)
-        prefix_hashes = self._prefix_hash(token_chunks)
+        with NVTXContext("token_sub_processing_setup"):
+            # Process tokens in chunks using parent class's chunking
+            token_chunks = self._chunk_tokens(tokens)
+            prefix_hashes = self._prefix_hash(token_chunks)
         
         start_idx = 0
         for chunk_id, prefix_hash in enumerate(prefix_hashes):

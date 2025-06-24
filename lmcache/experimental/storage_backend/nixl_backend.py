@@ -299,6 +299,8 @@ class NixlBackend(StorageBackendInterface):
         self._registered_metadatas = metadatas
         self._nixl_channel.prepare_send(keys=keys, metadatas=metadatas)
 
+    @_lmcache_nvtx_annotate
+    @torch.inference_mode()
     def allocate_zero_copy_write_object(
         self,
         shape: torch.Size,

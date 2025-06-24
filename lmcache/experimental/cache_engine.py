@@ -38,8 +38,12 @@ from lmcache.experimental.token_database import (ChunkedTokenDatabase,
 from lmcache.logging import init_logger
 from lmcache.observability import LMCacheStatsLogger, LMCStatsMonitor
 from lmcache.usage_context import InitializeUsageContext
-from lmcache.utils import CacheEngineKey, LayerCacheEngineKey, _lmcache_nvtx_annotate
+from lmcache.utils import CacheEngineKey, LayerCacheEngineKey, _lmcache_nvtx_annotate, NVTXContext
 from lmcache.experimental.storage_backend.connector.nixl_connector_v2 import NixlObserverInterface
+
+## TODO: remove this after nvtx is fixed
+from nvtx import annotate  # type: ignore
+from lmcache.utils import _get_color_for_nvtx
 
 logger = init_logger(__name__)
 
@@ -163,6 +167,8 @@ class LayerAwareNixlObserver(NixlObserverInterface):
         """Get list of ready layer IDs."""
         return [i for i, ready in enumerate(self._layer_ready_flags) if ready]
     
+    @_lmcache_nvtx_annotate
+    @torch.inference_mode()
     def wait_for_layer_busy(self, layer_id: int, timeout_us: int = 1000) -> bool:
         """
         Busy wait for layer readiness with microsecond precision.
@@ -1117,6 +1123,8 @@ class LayerAwareLMCacheEngine(LMCacheEngine):
 
             logger.info("Registered LayerAwareNixlObserver with NixlBackend for RDMA layer tracking")
         
+    @_lmcache_nvtx_annotate
+    @torch.inference_mode()
     def _group_keys_by_layers_first(
         self, 
         tokens: torch.Tensor, 
@@ -1130,16 +1138,65 @@ class LayerAwareLMCacheEngine(LMCacheEngine):
         """
         layers_data = {}
         
-        for start, end, layer_key in self.token_database.process_tokens(tokens, mask):
-            assert isinstance(layer_key, LayerCacheEngineKey)
-            
-            layer_id = layer_key.layer_id
-            if layer_id not in layers_data:
-                layers_data[layer_id] = []
-            
-            layers_data[layer_id].append((start, end, layer_key))
+        # Add fine-grained profiling for the generator loop
+        with NVTXContext("token_processing_setup"):
+            token_processor = self.token_database.process_tokens(tokens, mask)
+        
+        iteration_count = 0
+        for start, end, layer_key in token_processor:
+            with NVTXContext(f"process_token_chunk_{iteration_count}"):
+                assert isinstance(layer_key, LayerCacheEngineKey)
+                
+                layer_id = layer_key.layer_id
+                if layer_id not in layers_data:
+                    layers_data[layer_id] = []
+                
+                layers_data[layer_id].append((start, end, layer_key))
+                iteration_count += 1
         
         return layers_data
+
+    @_lmcache_nvtx_annotate
+    @torch.inference_mode()
+    def _get_layer_keys_for_single_layer(
+        self, 
+        layer_id: int,
+        tokens: torch.Tensor, 
+        mask: Optional[torch.Tensor] = None
+    ) -> List[tuple]:
+        """
+        Get layer keys for a specific layer only, avoiding unnecessary computation.
+        
+        This is more efficient than _group_keys_by_layers_first when only one layer is needed,
+        as it avoids processing tokens for all layers.
+        
+        Args:
+            layer_id: The specific layer ID to get keys for
+            tokens: Input tokens to process
+            mask: Optional mask for the tokens
+            
+        Returns:
+            List of (start, end, layer_key) tuples for the specified layer only
+        """
+        layer_chunks = []
+        
+        # Check if token_database supports layer-specific processing
+        if hasattr(self.token_database, 'process_tokens_for_layer'):
+            # Use the optimized layer-specific method
+            with NVTXContext("token_processing_setup_single_layer"):
+                token_processor = self.token_database.process_tokens_for_layer(tokens, layer_id, mask)
+            
+            for start, end, layer_key in token_processor:
+                with NVTXContext(f"process_token_chunk_layer_{layer_id}"):
+                    assert isinstance(layer_key, LayerCacheEngineKey)
+                    assert layer_key.layer_id == layer_id
+                    layer_chunks.append((start, end, layer_key))
+        else:
+            # Fallback to the original method and filter
+            layers_data = self._group_keys_by_layers_first(tokens, mask)
+            layer_chunks = layers_data.get(layer_id, [])
+        
+        return layer_chunks
 
     @_lmcache_nvtx_annotate
     @torch.inference_mode()
@@ -1184,13 +1241,13 @@ class LayerAwareLMCacheEngine(LMCacheEngine):
         if layer_ids is None:
             layer_ids = sorted(layers_data.keys())
         else:
-            # Validate layer IDs
-            for layer_id in layer_ids:
-                if layer_id < 0 or layer_id >= self.num_layers:
-                    raise ValueError(f"Invalid layer ID: {layer_id}")
-                if layer_id not in layers_data:
-                    logger.warning(f"No data for layer {layer_id}")
-                    
+                # Validate layer IDs
+                for layer_id in layer_ids:
+                    if layer_id < 0 or layer_id >= self.num_layers:
+                        raise ValueError(f"Invalid layer ID: {layer_id}")
+                    if layer_id not in layers_data:
+                        logger.warning(f"No data for layer {layer_id}")
+                        
         # Determine memory format based on GPU connector type
         memory_format = self._get_memory_format_for_connector()
         
@@ -1236,6 +1293,8 @@ class LayerAwareLMCacheEngine(LMCacheEngine):
             # Other connectors use layer-first format: [2, num_layers, num_tokens, hidden_dim]
             return MemoryFormat.KV_2LTD
 
+    @_lmcache_nvtx_annotate
+    @torch.inference_mode()
     def _store_single_layer_progressive(
         self,
         layer_id: int,
@@ -1278,6 +1337,8 @@ class LayerAwareLMCacheEngine(LMCacheEngine):
         
         return layer_stored
 
+    @_lmcache_nvtx_annotate
+    @torch.inference_mode()
     def _store_layer_rdma(
         self,
         layer_id: int,
@@ -1493,15 +1554,13 @@ class LayerAwareLMCacheEngine(LMCacheEngine):
         
         # Determine memory format based on GPU connector type
         memory_format = self._get_memory_format_for_connector()
-        
-        # Get layer-specific chunks
-        layers_data = self._group_keys_by_layers_first(tokens, mask)
-        if layer_id not in layers_data:
+
+        # Get layer-specific chunks using optimized single-layer processing
+        layer_chunks = self._get_layer_keys_for_single_layer(layer_id, tokens, mask)
+        if not layer_chunks:
             logger.debug(f"No data for layer {layer_id}")
             self.stats_monitor.on_retrieve_finished(monitor_req_id, 0)
             return None
-
-        layer_chunks = layers_data[layer_id]
         
         # Retrieve data using the appropriate method
         if using_nixl:
@@ -1517,47 +1576,6 @@ class LayerAwareLMCacheEngine(LMCacheEngine):
         
         self.stats_monitor.on_retrieve_finished(monitor_req_id, retrieved_tokens)
         return ret_mask
-
-    @_lmcache_nvtx_annotate
-    def retrieve_layers_progressive(
-        self,
-        tokens: torch.Tensor,
-        mask: Optional[torch.Tensor] = None,
-        max_layers: Optional[int] = None,
-        timeout_per_layer_us: int = 1000,
-        **kwargs
-    ) -> Dict[int, torch.Tensor]:
-        """
-        Retrieve layers progressively as they become ready.
-        
-        Args:
-            tokens: Input tokens to process
-            mask: Optional mask for selective token retrieval
-            max_layers: Maximum number of layers to retrieve (default: all)
-            timeout_per_layer_us: Timeout per layer in microseconds
-            **kwargs: Additional arguments for GPU connector
-            
-        Returns:
-            Dict mapping layer_id -> retrieval mask for successfully retrieved layers
-        """
-        if max_layers is None:
-            max_layers = self.num_layers
-            
-        target_layers = list(range(min(max_layers, self.num_layers)))
-        ready_layers = self.layer_status.wait_for_layers_batch(
-            target_layers, timeout_us=timeout_per_layer_us * len(target_layers)
-        )
-        
-        results = {}
-        for layer_id in ready_layers:
-            ret_mask = self.retrieve_layer_when_ready(
-                layer_id, tokens, mask, timeout_us=100, **kwargs  # Short timeout since we know it's ready
-            )
-            if ret_mask is not None:
-                results[layer_id] = ret_mask
-        
-        logger.info(f"Progressive retrieval: {len(results)}/{len(target_layers)} layers retrieved")
-        return results
 
     def get_layer_readiness_status(self) -> Dict:
         """Get comprehensive layer readiness status."""
@@ -1707,6 +1725,8 @@ class LayerAwareLMCacheEngine(LMCacheEngine):
                 
         return ret_mask
 
+    @_lmcache_nvtx_annotate
+    @torch.inference_mode()
     def _retrieve_layer_rdma(
         self,
         layer_id: int,
