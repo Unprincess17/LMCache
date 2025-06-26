@@ -150,7 +150,7 @@ class LayerCacheEngineKey(CacheEngineKey):
             raise ValueError(f"Invalid key string: {s}")
         return LayerCacheEngineKey(parts[0], parts[1], int(parts[2]),
                                    int(parts[3]), parts[4], int(parts[5]))
-    
+
     def to_dict(self):
         return {
             "__type__": "LayerCacheEngineKey",
@@ -161,7 +161,7 @@ class LayerCacheEngineKey(CacheEngineKey):
             "chunk_hash": self.chunk_hash,
             "layer_id": self.layer_id
         }
-    
+
     @staticmethod
     def from_dict(d):
         return LayerCacheEngineKey(fmt=d["fmt"],
@@ -195,53 +195,55 @@ def _lmcache_nvtx_annotate(func, domain="lmcache"):
 
 def _lmcache_nvtx_annotate_generator(func, domain="lmcache"):
     """Decorator for applying nvtx annotations to generator functions."""
+
     def wrapper(*args, **kwargs):
         gen = func(*args, **kwargs)
         func_name = func.__qualname__
-        
+
         try:
             # Annotate the generator setup
-            with annotate(message=f"{func_name}_setup", 
-                         color=_get_color_for_nvtx(func_name), 
-                         domain=domain):
+            with annotate(message=f"{func_name}_setup",
+                          color=_get_color_for_nvtx(func_name),
+                          domain=domain):
                 value = next(gen)
-            
+
             iteration = 0
             while True:
                 try:
                     # Annotate each yield/iteration
-                    with annotate(message=f"{func_name}_iter_{iteration}", 
-                                 color=_get_color_for_nvtx(func_name), 
-                                 domain=domain):
+                    with annotate(message=f"{func_name}_iter_{iteration}",
+                                  color=_get_color_for_nvtx(func_name),
+                                  domain=domain):
                         # Send value to generator and get next
                         sent_value = yield value
                         value = gen.send(sent_value)
                     iteration += 1
                 except StopIteration as e:
                     return e.value
-                    
+
         except GeneratorExit:
             gen.close()
             raise
         except Exception:
             gen.throw(*sys.exc_info())
             raise
-    
+
     return wrapper
 
 
 class NVTXContext:
     """Context manager for fine-grained NVTX annotations"""
+
     def __init__(self, message: str, domain: str = "lmcache"):
         self.message = message
         self.domain = domain
         self.color = _get_color_for_nvtx(message)
-    
+
     def __enter__(self):
         from nvtx import push_range
         push_range(message=self.message, color=self.color, domain=self.domain)
         return self
-    
+
     def __exit__(self, exc_type, exc_val, exc_tb):
         from nvtx import pop_range
         pop_range(domain=self.domain)

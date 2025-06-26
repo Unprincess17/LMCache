@@ -705,7 +705,8 @@ class NixlReceiver:
                 observer(
                     keys=keys[offset:offset + len(objs_read)],
                     objs=objs_read,
-                    is_view=True  # indicate these are views 
+                    is_view=
+                    True  # indicate these are views # TODO: What is is_view?
                 )
             end = time.perf_counter()
             logger.debug("Observers processing in %.4f ms",

@@ -21,15 +21,15 @@ def generate_test_tokens(num_chunks: int, chunk_size: int) -> torch.Tensor:
     """
     # Create sequential tokens for testing
     return torch.arange(0,
-                       num_chunks * chunk_size,
-                       dtype=torch.long,
-                       device="cuda")
+                        num_chunks * chunk_size,
+                        dtype=torch.long,
+                        device="cuda")
 
 
 def generate_kv_cache_paged_list_tensors(num_blocks,
-                                        device,
-                                        block_size=16,
-                                        dtype=torch.bfloat16):
+                                         device,
+                                         block_size=16,
+                                         dtype=torch.bfloat16):
     """
     Generate paged KV cache tensors for testing.
     Returns a list of tensors, one for each layer.
@@ -53,7 +53,7 @@ def fill_kv_cache_with_pattern(kv_cache, slot_mapping, pattern_value=0.99):
     """Fill the KV cache at the specified slot mappings with a recognizable pattern"""
     print(slot_mapping.shape)
     for layer_idx, layer_tensor in tqdm(enumerate(kv_cache),
-                                      total=len(kv_cache)):
+                                        total=len(kv_cache)):
         # Fill both K and V with the pattern value
         num_blocks = layer_tensor.shape[1]
         block_size = layer_tensor.shape[2]
@@ -64,14 +64,14 @@ def fill_kv_cache_with_pattern(kv_cache, slot_mapping, pattern_value=0.99):
 
 
 def verify_kv_cache_pattern(kv_cache,
-                           slot_mapping,
-                           pattern_value=0.99,
-                           tolerance=0.01):
+                            slot_mapping,
+                            pattern_value=0.99,
+                            tolerance=0.01):
     """Verify that the KV cache contains the expected pattern at the specified slot mappings"""
     logger.info(f"Verifying KV cache pattern {pattern_value}")
     all_correct = True
     for layer_idx, layer_tensor in tqdm(enumerate(kv_cache),
-                                      total=len(kv_cache)):
+                                        total=len(kv_cache)):
         num_blocks = layer_tensor.shape[1]
         block_size = layer_tensor.shape[2]
         new_shape = (2, num_blocks * block_size, 8, 128)
@@ -80,7 +80,7 @@ def verify_kv_cache_pattern(kv_cache,
         mean_value = actual_values.mean().item()
         if abs(mean_value - pattern_value) > tolerance:
             logger.error(f"Pattern mismatch at layer {layer_idx}: "
-                        f"expected mean ~{pattern_value}, got {mean_value}")
+                         f"expected mean ~{pattern_value}, got {mean_value}")
             all_correct = False
 
     return all_correct
@@ -126,37 +126,37 @@ def create_metadata() -> LMCacheEngineMetadata:
     kv_shape = (num_layers, 2, chunk_size, num_heads, head_dim)
 
     return LMCacheEngineMetadata(model_name="test_model",
-                                world_size=1,
-                                worker_id=0,
-                                fmt="vllm",
-                                kv_dtype=torch.bfloat16,
-                                kv_shape=kv_shape)
+                                 world_size=1,
+                                 worker_id=0,
+                                 fmt="vllm",
+                                 kv_dtype=torch.bfloat16,
+                                 kv_shape=kv_shape)
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description='Test LayerwiseLMCacheEngine with Nixl backend')
     parser.add_argument('--role',
-                       type=str,
-                       required=True,
-                       choices=['sender', 'receiver'],
-                       help='Role of this instance (sender or receiver)')
+                        type=str,
+                        required=True,
+                        choices=['sender', 'receiver'],
+                        help='Role of this instance (sender or receiver)')
     parser.add_argument('--host',
-                       type=str,
-                       default='localhost',
-                       help='Host name/IP for connection')
+                        type=str,
+                        default='localhost',
+                        help='Host name/IP for connection')
     parser.add_argument('--port',
-                       type=int,
-                       default=5555,
-                       help='Port number for connection')
+                        type=int,
+                        default=5555,
+                        help='Port number for connection')
     parser.add_argument('--num-chunks',
-                       type=int,
-                       default=10,
-                       help='Number of chunks to send')
+                        type=int,
+                        default=10,
+                        help='Number of chunks to send')
     parser.add_argument('--num-rounds',
-                       type=int,
-                       default=1,
-                       help='Number of times to run the experiment')
+                        type=int,
+                        default=1,
+                        help='Number of times to run the experiment')
     args = parser.parse_args()
 
     # Set fixed random seed for reproducibility
@@ -197,10 +197,10 @@ if __name__ == "__main__":
 
     # Create the LayerwiseLMCacheEngine
     engine = LMCacheEngineBuilder.get_or_create("test_engine",
-                                               config,
-                                               metadata,
-                                               gpu_connector,
-                                               use_layerwise_engine=True)
+                                                config,
+                                                metadata,
+                                                gpu_connector,
+                                                use_layerwise_engine=True)
 
     # Generate or create buffers that will be reused across rounds
     tokens = generate_test_tokens(args.num_chunks, config.chunk_size)
@@ -210,11 +210,11 @@ if __name__ == "__main__":
 
     if args.role == "sender":
         # Generate KV cache once and reuse
-        kv_cache = generate_kv_cache_paged_list_tensors(num_blocks, device,
-                                                       block_size, dtype)
+        kv_cache = generate_kv_cache_paged_list_tensors(
+            num_blocks, device, block_size, dtype)
         pattern_value = 0.99
         kv_cache = fill_kv_cache_with_pattern(kv_cache, slot_mapping,
-                                             pattern_value)
+                                              pattern_value)
     else:  # receiver
         # Create retrieval buffer once and reuse
         retrieved_cache = generate_kv_cache_paged_list_tensors(
@@ -236,8 +236,8 @@ if __name__ == "__main__":
 
             # Use store_layer generator for layerwise storage
             store_generator = engine.store_layer(tokens,
-                                               kvcaches=kv_cache,
-                                               slot_mapping=slot_mapping)
+                                                 kvcaches=kv_cache,
+                                                 slot_mapping=slot_mapping)
             for _ in store_generator:
                 pass
 
@@ -268,7 +268,7 @@ if __name__ == "__main__":
                 # Check for timeout
                 if time.time() - start_time > timeout:
                     logger.error("Timed out waiting for data. Received only "
-                               f"{received_count}/{args.num_chunks} chunks.")
+                                 f"{received_count}/{args.num_chunks} chunks.")
                     break
 
                 time.sleep(0.1)  # Small sleep to avoid busy waiting
@@ -306,15 +306,17 @@ if __name__ == "__main__":
                     # has the expected pattern
                     pattern_value = 0.99  # Same value used by sender
                     if verify_kv_cache_pattern(retrieved_cache, slot_mapping,
-                                             pattern_value):
+                                               pattern_value):
                         logger.info(
-                            "✅ Data verification successful - pattern matches!")
+                            "✅ Data verification successful - pattern matches!"
+                        )
                     else:
                         logger.error(
-                            "❌ Data verification failed - pattern doesn't match!")
+                            "❌ Data verification failed - pattern doesn't match!"
+                        )
                 else:
                     logger.error("Failed to retrieve all tokens. Retrieved "
-                               f"{retrieved_tokens}/{len(tokens)} tokens.")
+                                 f"{retrieved_tokens}/{len(tokens)} tokens.")
             else:
                 logger.error(
                     f"Only received {received_count}/{args.num_chunks} chunks")
@@ -328,7 +330,7 @@ if __name__ == "__main__":
         std_throughput = np.std(throughputs) if len(throughputs) > 1 else 0
         logger.info("\nSummary Statistics:")
         logger.info(f"Mean throughput: {mean_throughput:.2f} ± "
-                   f"{std_throughput:.2f} GB/s")
+                    f"{std_throughput:.2f} GB/s")
         logger.info(f"Min throughput: {min(throughputs):.2f} GB/s")
         logger.info(f"Max throughput: {max(throughputs):.2f} GB/s")
 

@@ -519,14 +519,14 @@ class DistributedStorageManager:
             # The memory is already in the right place
             # Just update the backend's internal state
             self.storage_backend.update_put_state(key, memory_obj)
-            
+
             # Decrease reference count since we're done with this object
             memory_obj.ref_count_down()
 
     @_lmcache_nvtx_annotate
     def commit_put(self):
         self.storage_backend.flush_put_tasks()
-    
+
     @_lmcache_nvtx_annotate
     def get(
         self,

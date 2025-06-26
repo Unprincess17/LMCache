@@ -569,9 +569,8 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
                                               memory_objs_layer,
                                               strict=False):
                 assert memory_obj.metadata.fmt == MemoryFormat.KV_T2D
-                tmp_gpu_buffer_obj.tensor[start - offset:end -
-                                          offset].copy_(memory_obj.tensor,
-                                                        non_blocking=True)
+                tmp_gpu_buffer_obj.tensor[start - offset:end - offset].copy_(
+                    memory_obj.tensor, non_blocking=True)
 
             lmc_ops.single_layer_kv_transfer(
                 tmp_gpu_buffer_obj.tensor,
@@ -619,8 +618,8 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
 
     @_lmcache_nvtx_annotate
     def to_gpu_single_layer(self, memory_objs: List[MemoryObj],
-                           starts: List[int], ends: List[int], 
-                           layer_id: int, **kwargs):
+                            starts: List[int], ends: List[int], layer_id: int,
+                            **kwargs):
         """
         Transfer all chunks of a single layer from memory objects to GPU KV cache.
         
@@ -645,47 +644,52 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
 
         kvcaches: List[torch.Tensor] = kwargs["kvcaches"]
         slot_mapping: torch.Tensor = kwargs["slot_mapping"]
-        
+
         # Validate layer_id
         if layer_id >= len(kvcaches):
-            raise ValueError(f"layer_id {layer_id} exceeds available layers {len(kvcaches)}")
-        
+            raise ValueError(
+                f"layer_id {layer_id} exceeds available layers {len(kvcaches)}"
+            )
+
         # Build slot mapping for all chunks
         slot_mapping_chunks = []
         for start, end in zip(starts, ends, strict=False):
             slot_mapping_chunks.append(slot_mapping[start:end])
-        
+
         slot_mapping_full = torch.cat(slot_mapping_chunks, dim=0)
-        
+
         # Allocate GPU buffer for this transfer
         num_tokens = len(slot_mapping_full)
         buffer_shape = self.get_shape(num_tokens)
         tmp_gpu_buffer_obj = self.gpu_buffer_allocator.allocate(
             buffer_shape, self.dtype, MemoryFormat.KV_T2D)
-        
+
         if tmp_gpu_buffer_obj is None:
             raise RuntimeError("Failed to allocate GPU buffer in GPUConnector")
-        
+
         assert tmp_gpu_buffer_obj.tensor is not None
-        
+
         offset = starts[0] if starts else 0
-        
+
         try:
             # Copy memory objects to GPU buffer
             # Use load_stream for consistency with batched_to_gpu
             with torch.cuda.stream(self.load_stream):
-                for start, end, memory_obj in zip(starts, ends, memory_objs, strict=False):
+                for start, end, memory_obj in zip(starts,
+                                                  ends,
+                                                  memory_objs,
+                                                  strict=False):
                     assert memory_obj.metadata.fmt == MemoryFormat.KV_T2D, \
                         f"Expected KV_T2D format, got {memory_obj.metadata.fmt}"
                     assert memory_obj.tensor is not None, \
                         "Memory object tensor is None"
-                    
+
                     # Copy this chunk to the appropriate position in GPU buffer
                     buffer_start = start - offset
                     buffer_end = end - offset
                     tmp_gpu_buffer_obj.tensor[buffer_start:buffer_end].copy_(
                         memory_obj.tensor, non_blocking=True)
-                
+
                 # Transfer from GPU buffer to target layer KV cache
                 lmc_ops.single_layer_kv_transfer(
                     tmp_gpu_buffer_obj.tensor,
@@ -694,51 +698,58 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
                     slot_mapping_full,
                     False,  # False = LMCache to PagedBuffer direction
                 )
-            
+
             # Synchronize to ensure transfer completes
             self.load_stream.synchronize()
-            
+
         finally:
             # Always free the buffer, even if an exception occurred
             tmp_gpu_buffer_obj.ref_count_down()
-        
-        logger.debug(f"Transferred {len(memory_objs)} chunks to GPU for layer {layer_id}")
+
+        logger.debug(
+            f"Transferred {len(memory_objs)} chunks to GPU for layer {layer_id}"
+        )
 
     @_lmcache_nvtx_annotate
     def from_gpu_single_layer(self, memory_objs: List[MemoryObj],
-                             starts: List[int], ends: List[int], 
-                             layer_id: int, **kwargs):
+                              starts: List[int], ends: List[int],
+                              layer_id: int, **kwargs):
         """Store GPU data to memory objects for a single layer with detailed profiling."""
-        
+
         with NVTXContext(f"from_gpu_layer_{layer_id}_setup"):
             if "kvcaches" not in kwargs:
                 raise ValueError("'kvcaches' should be provided in kwargs.")
             if "slot_mapping" not in kwargs:
-                raise ValueError("'slot_mapping' should be provided in kwargs.")
-            
+                raise ValueError(
+                    "'slot_mapping' should be provided in kwargs.")
+
             kvcaches = kwargs["kvcaches"]
             slot_mapping_full = kwargs["slot_mapping"]
-            
+
             num_tokens = sum(end - start for start, end in zip(starts, ends))
-            logger.debug(f"GPU->Memory transfer for layer {layer_id}: {num_tokens} tokens")
-        
+            logger.debug(
+                f"GPU->Memory transfer for layer {layer_id}: {num_tokens} tokens"
+            )
+
         with NVTXContext(f"gpu_buffer_allocation_layer_{layer_id}"):
             buffer_shape = self.get_shape(num_tokens)
             tmp_gpu_buffer_obj = self.gpu_buffer_allocator.allocate(
                 buffer_shape, self.dtype, MemoryFormat.KV_T2D)
-            
+
             if tmp_gpu_buffer_obj is None:
-                raise RuntimeError("Failed to allocate GPU buffer in GPUConnector")
-            
+                raise RuntimeError(
+                    "Failed to allocate GPU buffer in GPUConnector")
+
             assert tmp_gpu_buffer_obj.tensor is not None
             offset = starts[0] if starts else 0
-        
+
         try:
             with NVTXContext(f"gpu_transfer_layer_{layer_id}"):
                 # Transfer from GPU KV cache to buffer, then to memory objects
                 # Use store_stream for consistency with batched_from_gpu
                 with torch.cuda.stream(self.store_stream):
-                    with NVTXContext(f"single_layer_kv_transfer_layer_{layer_id}"):
+                    with NVTXContext(
+                            f"single_layer_kv_transfer_layer_{layer_id}"):
                         # Transfer from paged GPU memory to linear buffer
                         lmc_ops.single_layer_kv_transfer(
                             tmp_gpu_buffer_obj.tensor,
@@ -747,32 +758,36 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
                             slot_mapping_full,
                             True,  # True = PagedBuffer to LMCache direction
                         )
-                    
+
                     with NVTXContext(f"memory_copy_layer_{layer_id}"):
                         # Copy from GPU buffer to memory objects
-                        for i, (start, end, memory_obj) in enumerate(zip(starts, ends, memory_objs, strict=False)):
-                            with NVTXContext(f"chunk_copy_{i}_layer_{layer_id}"):
+                        for i, (start, end, memory_obj) in enumerate(
+                                zip(starts, ends, memory_objs, strict=False)):
+                            with NVTXContext(
+                                    f"chunk_copy_{i}_layer_{layer_id}"):
                                 assert memory_obj.tensor is not None, \
                                     "Memory object tensor is None"
-                                
+
                                 # Copy this chunk from the appropriate position in GPU buffer
                                 buffer_start = start - offset
                                 buffer_end = end - offset
                                 memory_obj.tensor.copy_(
-                                    tmp_gpu_buffer_obj.tensor[buffer_start:buffer_end],
+                                    tmp_gpu_buffer_obj.
+                                    tensor[buffer_start:buffer_end],
                                     non_blocking=True)
-                
+
                 with NVTXContext(f"stream_synchronize_layer_{layer_id}"):
                     # Synchronize to ensure all transfers complete
                     # This is a major bottleneck!
                     self.store_stream.synchronize()
-                
+
         finally:
             with NVTXContext(f"buffer_cleanup_layer_{layer_id}"):
                 # Always free the buffer, even if an exception occurred
                 tmp_gpu_buffer_obj.ref_count_down()
-        
-        logger.debug(f"Transferred {len(memory_objs)} chunks from GPU layer {layer_id}")
+
+        logger.debug(
+            f"Transferred {len(memory_objs)} chunks from GPU layer {layer_id}")
 
     @_lmcache_nvtx_annotate
     def batched_from_gpu(self, memory_objs: List[List[MemoryObj]],
@@ -852,7 +867,8 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
                                                       strict=False):
                         assert memory_obj.tensor is not None
                         memory_obj.tensor.copy_(
-                            tmp_gpu_buffer_obj.tensor[start - offset:end - offset],
+                            tmp_gpu_buffer_obj.tensor[start - offset:end -
+                                                      offset],
                             non_blocking=True)
 
                 # Synchronize to ensure this layer's data is fully copied before yielding
