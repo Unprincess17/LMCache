@@ -195,6 +195,7 @@ class LayerAwareNixlObserver(NixlObserverInterface):
         # Track layer readiness and statistics
         self._layer_ready_flags = [False] * num_layers
         self._layer_chunk_counts = [0] * num_layers
+        self._layer_expected_chunks = [None] * num_layers  # None = unknown, set dynamically
         self._layer_ready_timestamps = [0.0] * num_layers
 
         # Callbacks for layer readiness events
@@ -243,10 +244,11 @@ class LayerAwareNixlObserver(NixlObserverInterface):
                     # Update chunk count for this layer
                     self._layer_chunk_counts[layer_id] += 1
 
-                    # Mark layer as ready if not already marked
-                    if not self._layer_ready_flags[layer_id]:
-                        self._mark_layer_ready(layer_id)
-                        newly_ready_layers.add(layer_id)
+                    # Check if this layer is now complete
+                    if self._is_layer_complete(key, obj, layer_id):
+                        if not self._layer_ready_flags[layer_id]:
+                            self._mark_layer_ready(layer_id)
+                            newly_ready_layers.add(layer_id)
 
         # Fire callbacks for newly ready layers
         for layer_id in newly_ready_layers:
@@ -254,6 +256,48 @@ class LayerAwareNixlObserver(NixlObserverInterface):
 
         logger.debug(f"NixlObserver processed {len(keys)} objects, "
                      f"{len(newly_ready_layers)} layers became ready")
+
+    def _is_layer_complete(self, key: LayerCacheEngineKey, obj: MemoryObj, layer_id: int) -> bool:
+        """
+        Determine if a layer is complete based on received data.
+        
+        Uses multiple strategies to detect layer completion:
+        - Key-based: Check for total_chunks/chunk_id information
+        
+        Args:
+            key: The layer cache engine key
+            obj: The memory object received
+            layer_id: The layer ID being processed
+            
+        Returns:
+            True if the layer is complete, False otherwise
+        """
+        # Strategy 2: Check if key contains chunk count information  
+        if hasattr(key, 'total_chunks'):
+            if self._layer_expected_chunks[layer_id] is None:
+                self._layer_expected_chunks[layer_id] = key.total_chunks
+                logger.debug(f"Layer {layer_id} expected chunks set to {key.total_chunks}")
+            
+            is_complete = self._layer_chunk_counts[layer_id] >= self._layer_expected_chunks[layer_id]
+            if is_complete:
+                logger.debug(f"Layer {layer_id} marked complete via key info ({self._layer_chunk_counts[layer_id]}/{self._layer_expected_chunks[layer_id]} chunks)")
+            return is_complete
+            
+        return False
+
+    def set_expected_chunks_per_layer(self, layer_id: int, expected_chunks: int) -> None:
+        """
+        Manually set the expected number of chunks for a specific layer.
+        
+        This provides backward compatibility and allows explicit control when needed.
+        
+        Args:
+            layer_id: The layer ID
+            expected_chunks: Expected number of chunks for this layer
+        """
+        if layer_id < self.num_layers:
+            self._layer_expected_chunks[layer_id] = expected_chunks
+            logger.debug(f"Layer {layer_id} expected chunks manually set to {expected_chunks}")
 
     def _mark_layer_ready(self, layer_id: int) -> None:
         """Mark a layer as ready (internal method)."""
@@ -290,17 +334,18 @@ class LayerAwareNixlObserver(NixlObserverInterface):
             self._mark_layer_ready(layer_id)
             self._fire_callbacks_async(layer_id)
 
-    def is_layer_ready(self, layer_id: int) -> bool:
+    def is_layer_ready(self, layer_id: int, num_chunks: Optional[int] = 1) -> bool:
         """Check if layer is ready."""
         if layer_id >= self.num_layers:
             return False
-        return self._layer_ready_flags[layer_id]
+        return self._layer_chunk_counts[layer_id] >= num_chunks
 
     @_lmcache_nvtx_annotate
     @torch.inference_mode()
     def wait_for_layer_busy(self,
                             layer_id: int,
-                            timeout_us: int = 1000) -> bool:
+                            timeout_us: int = 1000,
+                            num_chunks: Optional[int] = 1) -> bool:
         """
         Busy wait for layer readiness with microsecond precision.
         
@@ -315,7 +360,7 @@ class LayerAwareNixlObserver(NixlObserverInterface):
             return False
 
         start = time.perf_counter()
-        while not self.is_layer_ready(layer_id):
+        while not self.is_layer_ready(layer_id, num_chunks):
             elapsed_us = (time.perf_counter() - start) * 1e6
             if elapsed_us > timeout_us:
                 return False
@@ -698,11 +743,12 @@ class NixlBackend(StorageBackendInterface):
 
     def wait_for_layer_busy(self,
                             layer_id: int,
-                            timeout_us: int = 1000) -> bool:
+                            timeout_us: int = 1000,
+                            num_chunks: Optional[int] = 1) -> bool:
         """Busy wait for a layer to become ready."""
         if hasattr(self._nixl_observer, 'wait_for_layer_busy'):
             return self._nixl_observer.wait_for_layer_busy(
-                layer_id, timeout_us)
+                layer_id, timeout_us, num_chunks)
         return False
 
     def get_layer_observer(self):

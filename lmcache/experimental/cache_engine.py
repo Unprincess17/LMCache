@@ -1307,8 +1307,9 @@ class LayerAwareLMCacheEngine(LMCacheEngine):
             Boolean mask indicating which tokens were retrieved, or None if timeout
         """
         # Wait for layer to be ready with microsecond precision
+        num_chunks = kwargs.get('num_chunks', 1) # At least 1 chunk.
         if not self.storage_manager.storage_backend.wait_for_layer_busy(
-                layer_id, timeout_us):
+                layer_id, timeout_us, num_chunks):
             logger.debug(f"Layer {layer_id} not ready within {timeout_us}μs")
             return None
 
@@ -1354,25 +1355,6 @@ class LayerAwareLMCacheEngine(LMCacheEngine):
         self.stats_monitor.on_retrieve_finished(monitor_req_id,
                                                 retrieved_tokens)
         return ret_mask
-
-    # def get_layer_readiness_status(self) -> Dict:
-    #     """Get comprehensive layer readiness status."""
-    #     ready_layers = self.layer_status.get_ready_layers()
-    #     transfer_progress = self.layer_status.get_transfer_progress()
-
-    #     layer_stats = {}
-    #     for layer_id in range(self.num_layers):
-    #         layer_stats[layer_id] = self.layer_status.get_layer_stats(layer_id)
-
-    #     return {
-    #         "ready_layers": ready_layers,
-    #         "transfer_progress": transfer_progress,
-    #         "layer_stats": layer_stats
-    #     }
-
-    # def register_layer_ready_callback(self, layer_id: int, callback: Callable[[int], None]) -> None:
-    #     """Register callback for when specific layer becomes ready."""
-    #     self.layer_status.register_callback(layer_id, callback)
 
     def wait_for_early_layers(self,
                               num_layers: int = 1,

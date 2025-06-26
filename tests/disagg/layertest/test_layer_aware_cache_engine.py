@@ -95,7 +95,7 @@ def verify_layer_pattern(kv_cache,
     mean_value = actual_values.mean().item()
     is_correct = abs(mean_value - expected_pattern) <= tolerance
 
-    logger.debug(
+    logger.info(
         f"Layer {layer_id} verification: expected={expected_pattern:.3f}, "
         f"actual={mean_value:.3f}, correct={is_correct}")
 
@@ -426,7 +426,8 @@ def run_receiver(args, config, metadata, tokens, retrieved_cache, slot_mapping,
                 tokens=tokens,
                 timeout_us=500000,  # 500ms timeout since we know it's ready
                 kvcaches=retrieved_cache,
-                slot_mapping=slot_mapping)
+                slot_mapping=slot_mapping,
+                num_chunks=args.num_chunks)
 
             perf_tracker.record_layer_retrieve_end(target_layer,
                                                    retrieve_start)
