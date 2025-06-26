@@ -15,7 +15,7 @@
 import threading
 import time
 from concurrent.futures import Future
-from typing import Optional
+from typing import Optional, Dict, List, Callable
 
 import torch
 
@@ -32,7 +32,7 @@ from lmcache.experimental.storage_backend.connector.nixl_connector_v2 import (
 from lmcache.experimental.storage_backend.connector.nixl_utils import (
     NixlConfig, NixlRole)
 from lmcache.logging import init_logger
-from lmcache.utils import CacheEngineKey, _lmcache_nvtx_annotate
+from lmcache.utils import CacheEngineKey, LayerCacheEngineKey, NVTXContext, _lmcache_nvtx_annotate
 
 logger = init_logger(__name__)
 
@@ -180,6 +180,207 @@ class RecvObjPool:
         raise NotImplementedError
 
 
+class LayerAwareNixlObserver(NixlObserverInterface):
+    """
+    NixlObserver implementation that tracks layer transfer status for disaggregated inference.
+    
+    This observer combines data reception handling with layer readiness tracking.
+    Layers are marked as ready only when the data is actually received through RDMA transfer.
+    """
+
+    def __init__(self, num_layers: int, obj_pool=None):
+        self.num_layers = num_layers
+        self.obj_pool = obj_pool  # Optional object pool for storing received data
+
+        # Track layer readiness and statistics
+        self._layer_ready_flags = [False] * num_layers
+        self._layer_chunk_counts = [0] * num_layers
+        self._layer_ready_timestamps = [0.0] * num_layers
+
+        # Callbacks for layer readiness events
+        self._callbacks: Dict[int, List[Callable]] = {
+            i: []
+            for i in range(num_layers)
+        }
+        self._callback_lock = threading.RLock()
+
+        # Statistics
+        self._total_layers_transferred = 0
+        self._transfer_start_time = time.perf_counter()
+
+    def __call__(self,
+                 keys: List[CacheEngineKey],
+                 objs: List[MemoryObj],
+                 is_view: bool = True):
+        """
+        Process received objects and update layer readiness status.
+        
+        Args:
+            keys: The CacheEngineKeys
+            objs: The list of MemoryObj
+            is_view: Whether the memory objects are views of the transfer buffer
+        """
+
+        # Track layers that become ready in this batch
+        newly_ready_layers = set()
+
+        # Process each received object
+        for key, obj in zip(keys, objs):
+            # Store in object pool if provided
+            if self.obj_pool is not None:
+                if is_view:
+                    # Clone the tensor since it's a view that will be overwritten
+                    copied_obj = TensorMemoryObj(obj.tensor.clone(),
+                                                 obj.metadata)
+                    self.obj_pool.add(key, copied_obj)
+                else:
+                    self.obj_pool.add(key, obj)
+
+            # Extract layer information if this is a layer-aware key
+            if isinstance(key, LayerCacheEngineKey):
+                layer_id = key.layer_id
+                if layer_id < self.num_layers:
+                    # Update chunk count for this layer
+                    self._layer_chunk_counts[layer_id] += 1
+
+                    # Mark layer as ready if not already marked
+                    if not self._layer_ready_flags[layer_id]:
+                        self._mark_layer_ready(layer_id)
+                        newly_ready_layers.add(layer_id)
+
+        # Fire callbacks for newly ready layers
+        for layer_id in newly_ready_layers:
+            self._fire_callbacks_async(layer_id)
+
+        logger.debug(f"NixlObserver processed {len(keys)} objects, "
+                     f"{len(newly_ready_layers)} layers became ready")
+
+    def _mark_layer_ready(self, layer_id: int) -> None:
+        """Mark a layer as ready (internal method)."""
+        self._layer_ready_timestamps[layer_id] = time.perf_counter()
+        self._layer_ready_flags[layer_id] = True
+        self._total_layers_transferred += 1
+
+        logger.debug(
+            f"Layer {layer_id} marked ready with {self._layer_chunk_counts[layer_id]} chunks"
+        )
+
+    def mark_layer_ready(self, layer_id: int, num_chunks: int) -> None:
+        """
+        Manually mark layer as ready (compatibility method).
+        
+        This method provides compatibility with existing code that manually signals layer readiness.
+        In normal RDMA operation, layers are marked ready automatically via the __call__ method.
+        
+        Args:
+            layer_id: The layer that is now ready
+            num_chunks: Number of chunks transferred for this layer
+        """
+        if layer_id >= self.num_layers:
+            logger.warning(
+                f"Invalid layer_id {layer_id}, max is {self.num_layers-1}")
+            return
+
+        # Update chunk count if provided
+        if num_chunks > 0:
+            self._layer_chunk_counts[layer_id] = num_chunks
+
+        # Mark layer as ready if not already marked
+        if not self._layer_ready_flags[layer_id]:
+            self._mark_layer_ready(layer_id)
+            self._fire_callbacks_async(layer_id)
+
+    def is_layer_ready(self, layer_id: int) -> bool:
+        """Check if layer is ready."""
+        if layer_id >= self.num_layers:
+            return False
+        return self._layer_ready_flags[layer_id]
+
+    @_lmcache_nvtx_annotate
+    @torch.inference_mode()
+    def wait_for_layer_busy(self,
+                            layer_id: int,
+                            timeout_us: int = 1000) -> bool:
+        """
+        Busy wait for layer readiness with microsecond precision.
+        
+        Args:
+            layer_id: Layer to wait for
+            timeout_us: Timeout in microseconds
+            
+        Returns:
+            True if layer became ready within timeout, False otherwise
+        """
+        if layer_id >= self.num_layers:
+            return False
+
+        start = time.perf_counter()
+        while not self.is_layer_ready(layer_id):
+            elapsed_us = (time.perf_counter() - start) * 1e6
+            if elapsed_us > timeout_us:
+                return False
+            time.sleep(0)  # Yield
+        return True
+
+    def wait_for_layers_batch(self,
+                              layer_ids: List[int],
+                              timeout_us: int = 5000) -> List[int]:
+        """
+        Wait for multiple layers and return those that become ready.
+        
+        Args:
+            layer_ids: List of layer IDs to wait for
+            timeout_us: Total timeout in microseconds
+            
+        Returns:
+            List of layer IDs that became ready within timeout
+        """
+        start = time.perf_counter()
+        ready_layers = []
+
+        while len(ready_layers) < len(layer_ids):
+            elapsed_us = (time.perf_counter() - start) * 1e6
+            if elapsed_us > timeout_us:
+                break
+
+            for layer_id in layer_ids:
+                if layer_id not in ready_layers and self.is_layer_ready(
+                        layer_id):
+                    ready_layers.append(layer_id)
+
+            if len(ready_layers) < len(layer_ids):
+                time.sleep(0)  # Yield
+
+        return sorted(ready_layers)
+
+    def reset(self) -> None:
+        """Reset all tracking state for a new transfer."""
+        self._layer_ready_flags = [False] * self.num_layers
+        self._layer_chunk_counts = [0] * self.num_layers
+        self._layer_ready_timestamps = [0.0] * self.num_layers
+        self._total_layers_transferred = 0
+        self._transfer_start_time = time.perf_counter()
+
+        # Clear callbacks
+        with self._callback_lock:
+            for layer_callbacks in self._callbacks.values():
+                layer_callbacks.clear()
+
+    def _fire_callbacks_async(self, layer_id: int) -> None:
+        """Fire callbacks in separate thread to avoid blocking critical path."""
+
+        def fire():
+            with self._callback_lock:
+                for callback in self._callbacks[layer_id]:
+                    try:
+                        callback(layer_id)
+                    except Exception as e:
+                        logger.error(
+                            f"Callback error for layer {layer_id}: {e}")
+
+        threading.Thread(target=fire, daemon=True).start()
+
+
 class BasicNixlObserver(NixlObserverInterface):
     """
     Basic implementation of the NixlObserverInterface to handle 
@@ -240,23 +441,37 @@ class NixlBackend(StorageBackendInterface):
     to the receiver side.
     """
 
-    def __init__(self, nixl_config: NixlConfig):
+    def __init__(self,
+                 nixl_config: NixlConfig,
+                 num_layers: Optional[int] = None):
         """
         Initialize the Nixl storage backend.
 
-        :param dst_device: the device where the blocking retrieved KV is stored,
-            could be either "cpu", "cuda", or "cuda:0", "cuda:1", etc.
+        :param nixl_config: the Nixl configuration
+        :param num_layers: number of layers for layer-aware tracking (required for RECEIVER role)
         """
         super().__init__(dst_device=nixl_config.buffer_device)
         self._obj_pool = RecvObjPool(nixl_config.enable_gc)
-        #self._data: dict[CacheEngineKey, MemoryObj] = {}
-        #self._data_lock = threading.Lock()
+        self._num_layers = num_layers
 
         self._nixl_channel = NixlChannel(nixl_config)
 
-        if nixl_config.role == NixlRole.RECEIVER:
-            self._nixl_observer = BasicNixlObserver(self._obj_pool)
-            self._nixl_channel.register_receive_observer(
+        with NVTXContext("Create Nixl Observer"):
+            if nixl_config.role == NixlRole.RECEIVER:
+                if num_layers is not None:
+                    # Use LayerAwareNixlObserver for layer tracking
+                    self._nixl_observer = LayerAwareNixlObserver(
+                        num_layers, self._obj_pool)
+                    logger.info(
+                        f"Created LayerAwareNixlObserver with {num_layers} layers for RDMA layer tracking"
+                    )
+                else:
+                    # Fallback to BasicNixlObserver if num_layers not provided
+                    self._nixl_observer = BasicNixlObserver(self._obj_pool)
+                    logger.info(
+                        "Created BasicNixlObserver (num_layers not provided)")
+
+                self._nixl_channel.register_receive_observer(
                 observer=self._nixl_observer)
 
         self._registered_keys: list[CacheEngineKey] = []
@@ -398,10 +613,10 @@ class NixlBackend(StorageBackendInterface):
         """
         if not self.contains(key):
             return None
-            
+
         # Create a Future object to represent the asynchronous operation
         future = Future()
-        
+
         def get_and_set_result():
             try:
                 # Get the memory object from the object pool
@@ -409,11 +624,11 @@ class NixlBackend(StorageBackendInterface):
                 future.set_result(result)
             except Exception as e:
                 future.set_exception(e)
-                
+
         # Start a new thread to perform the get operation
         thread = threading.Thread(target=get_and_set_result)
         thread.start()
-        
+
         return future
 
     def remove(self, key: CacheEngineKey) -> None:
@@ -442,7 +657,8 @@ class NixlBackend(StorageBackendInterface):
     def unpin(self, key: CacheEngineKey) -> bool:
         raise NotImplementedError
 
-    def update_put_state(self, key: CacheEngineKey, memory_obj: MemoryObj) -> None:
+    def update_put_state(self, key: CacheEngineKey,
+                         memory_obj: MemoryObj) -> None:
         """
         Update the backend's internal state after a memory object has been allocated
         and written to. This is used in the zero-copy write pattern.
@@ -455,19 +671,63 @@ class NixlBackend(StorageBackendInterface):
         # and the metadata was registered during prepare_put
         pass
 
+    # Layer status interface methods - delegate to LayerAwareNixlObserver if available
+    def mark_layer_ready(self, layer_id: int, num_chunks: int = 0) -> None:
+        """Mark a layer as ready for processing."""
+        if hasattr(self._nixl_observer, 'mark_layer_ready'):
+            self._nixl_observer.mark_layer_ready(layer_id, num_chunks)
+        else:
+            logger.debug(
+                f"mark_layer_ready called but observer doesn't support layer tracking"
+            )
+
+    def is_layer_ready(self, layer_id: int) -> bool:
+        """Check if a layer is ready for processing."""
+        if hasattr(self._nixl_observer, 'is_layer_ready'):
+            return self._nixl_observer.is_layer_ready(layer_id)
+        return False
+
+    def wait_for_layers_batch(self,
+                              layer_ids: list[int],
+                              timeout_us: int = 5000) -> list[int]:
+        """Wait for multiple layers to become ready."""
+        if hasattr(self._nixl_observer, 'wait_for_layers_batch'):
+            return self._nixl_observer.wait_for_layers_batch(
+                layer_ids, timeout_us)
+        return []
+
+    def wait_for_layer_busy(self,
+                            layer_id: int,
+                            timeout_us: int = 1000) -> bool:
+        """Busy wait for a layer to become ready."""
+        if hasattr(self._nixl_observer, 'wait_for_layer_busy'):
+            return self._nixl_observer.wait_for_layer_busy(
+                layer_id, timeout_us)
+        return False
+
+    def get_layer_observer(self):
+        """Get the layer-aware observer if available."""
+        if hasattr(self._nixl_observer, 'num_layers'):
+            return self._nixl_observer
+        return None
+
     @staticmethod
     def CreateNixlBackend(config: LMCacheEngineConfig,
                           metadata: LMCacheEngineMetadata) -> "NixlBackend":
         """
         Create a Nixl backend with the given configuration.
 
-        :param nixl_config: The Nixl configuration.
-        :param dst_device: The device where the data is stored.
+        :param config: The LMCache engine configuration.
+        :param metadata: The LMCache engine metadata containing layer information.
         
         :return: A NixlBackend instance.
         """
         # Create the Nixl config
         nixl_config = NixlConfig.from_cache_engine_config(config, metadata)
-        # Create the Nixl backend
-        backend = NixlBackend(nixl_config)
+
+        # Extract num_layers from metadata for layer-aware tracking
+        num_layers = metadata.kv_shape[0] if metadata.kv_shape else None
+
+        # Create the Nixl backend with layer awareness
+        backend = NixlBackend(nixl_config, num_layers)
         return backend

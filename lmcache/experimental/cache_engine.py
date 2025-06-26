@@ -52,230 +52,6 @@ class CacheEngineEndSignal:
     pass
 
 
-class LayerAwareNixlObserver(NixlObserverInterface):
-    """
-    NixlObserver implementation that tracks layer transfer status for disaggregated inference.
-    
-    This observer combines data reception handling with layer readiness tracking.
-    Layers are marked as ready only when the data is actually received through RDMA transfer.
-    """
-    
-    def __init__(self, num_layers: int, obj_pool=None):
-        self.num_layers = num_layers
-        self.obj_pool = obj_pool  # Optional object pool for storing received data
-        
-        # Track layer readiness and statistics
-        self._layer_ready_flags = [False] * num_layers
-        self._layer_chunk_counts = [0] * num_layers
-        self._layer_ready_timestamps = [0.0] * num_layers
-        
-        # Callbacks for layer readiness events
-        self._callbacks: Dict[int, List[Callable]] = {i: [] for i in range(num_layers)}
-        self._callback_lock = threading.RLock()
-        
-        # Statistics
-        self._total_layers_transferred = 0
-        self._transfer_start_time = time.perf_counter()
-    
-    def __call__(self,
-                 keys: List[CacheEngineKey],
-                 objs: List[MemoryObj],
-                 is_view: bool = True):
-        """
-        Process received objects and update layer readiness status.
-        
-        Args:
-            keys: The CacheEngineKeys
-            objs: The list of MemoryObj
-            is_view: Whether the memory objects are views of the transfer buffer
-        """
-        from lmcache.utils import LayerCacheEngineKey
-        
-        # Track layers that become ready in this batch
-        newly_ready_layers = set()
-        
-        # Process each received object
-        for key, obj in zip(keys, objs):
-            # Store in object pool if provided
-            if self.obj_pool is not None:
-                if is_view:
-                    # Clone the tensor since it's a view that will be overwritten
-                    from lmcache.experimental.memory_management import TensorMemoryObj
-                    copied_obj = TensorMemoryObj(obj.tensor.clone(), obj.metadata)
-                    self.obj_pool.add(key, copied_obj)
-                else:
-                    self.obj_pool.add(key, obj)
-            
-            # Extract layer information if this is a layer-aware key
-            if isinstance(key, LayerCacheEngineKey):
-                layer_id = key.layer_id
-                if layer_id < self.num_layers:
-                    # Update chunk count for this layer
-                    self._layer_chunk_counts[layer_id] += 1
-                    
-                    # Mark layer as ready if not already marked
-                    if not self._layer_ready_flags[layer_id]:
-                        self._mark_layer_ready(layer_id)
-                        newly_ready_layers.add(layer_id)
-        
-        # Fire callbacks for newly ready layers
-        for layer_id in newly_ready_layers:
-            self._fire_callbacks_async(layer_id)
-        
-        logger.debug(f"NixlObserver processed {len(keys)} objects, "
-                    f"{len(newly_ready_layers)} layers became ready")
-    
-    def _mark_layer_ready(self, layer_id: int) -> None:
-        """Mark a layer as ready (internal method)."""
-        self._layer_ready_timestamps[layer_id] = time.perf_counter()
-        self._layer_ready_flags[layer_id] = True
-        self._total_layers_transferred += 1
-        
-        logger.debug(f"Layer {layer_id} marked ready with {self._layer_chunk_counts[layer_id]} chunks")
-    
-    def mark_layer_ready(self, layer_id: int, num_chunks: int) -> None:
-        """
-        Manually mark layer as ready (compatibility method).
-        
-        This method provides compatibility with existing code that manually signals layer readiness.
-        In normal RDMA operation, layers are marked ready automatically via the __call__ method.
-        
-        Args:
-            layer_id: The layer that is now ready
-            num_chunks: Number of chunks transferred for this layer
-        """
-        if layer_id >= self.num_layers:
-            logger.warning(f"Invalid layer_id {layer_id}, max is {self.num_layers-1}")
-            return
-            
-        # Update chunk count if provided
-        if num_chunks > 0:
-            self._layer_chunk_counts[layer_id] = num_chunks
-        
-        # Mark layer as ready if not already marked
-        if not self._layer_ready_flags[layer_id]:
-            self._mark_layer_ready(layer_id)
-            self._fire_callbacks_async(layer_id)
-    
-    def is_layer_ready(self, layer_id: int) -> bool:
-        """Check if layer is ready."""
-        if layer_id >= self.num_layers:
-            return False
-        return self._layer_ready_flags[layer_id]
-    
-    def get_ready_layers(self) -> List[int]:
-        """Get list of ready layer IDs."""
-        return [i for i, ready in enumerate(self._layer_ready_flags) if ready]
-    
-    @_lmcache_nvtx_annotate
-    @torch.inference_mode()
-    def wait_for_layer_busy(self, layer_id: int, timeout_us: int = 1000) -> bool:
-        """
-        Busy wait for layer readiness with microsecond precision.
-        
-        Args:
-            layer_id: Layer to wait for
-            timeout_us: Timeout in microseconds
-            
-        Returns:
-            True if layer became ready within timeout, False otherwise
-        """
-        if layer_id >= self.num_layers:
-            return False
-            
-        start = time.perf_counter()
-        while not self.is_layer_ready(layer_id):
-            elapsed_us = (time.perf_counter() - start) * 1e6
-            if elapsed_us > timeout_us:
-                return False
-            time.sleep(0)  # Yield
-        return True
-    
-    def wait_for_layers_batch(self, layer_ids: List[int], timeout_us: int = 5000) -> List[int]:
-        """
-        Wait for multiple layers and return those that become ready.
-        
-        Args:
-            layer_ids: List of layer IDs to wait for
-            timeout_us: Total timeout in microseconds
-            
-        Returns:
-            List of layer IDs that became ready within timeout
-        """
-        start = time.perf_counter()
-        ready_layers = []
-        
-        while len(ready_layers) < len(layer_ids):
-            elapsed_us = (time.perf_counter() - start) * 1e6
-            if elapsed_us > timeout_us:
-                break
-                
-            for layer_id in layer_ids:
-                if layer_id not in ready_layers and self.is_layer_ready(layer_id):
-                    ready_layers.append(layer_id)
-                    
-            if len(ready_layers) < len(layer_ids):
-                time.sleep(0)  # Yield
-                
-        return sorted(ready_layers)
-    
-    def register_callback(self, layer_id: int, callback: Callable[[int], None]) -> None:
-        """Register callback for when layer becomes ready."""
-        with self._callback_lock:
-            self._callbacks[layer_id].append(callback)
-    
-    def get_layer_stats(self, layer_id: int) -> Dict:
-        """Get statistics for a specific layer."""
-        if layer_id >= self.num_layers or not self.is_layer_ready(layer_id):
-            return {"ready": False}
-            
-        return {
-            "ready": True,
-            "num_chunks": self._layer_chunk_counts[layer_id],
-            "ready_timestamp": self._layer_ready_timestamps[layer_id],
-            "transfer_latency_ms": (self._layer_ready_timestamps[layer_id] - self._transfer_start_time) * 1000
-        }
-    
-    def get_transfer_progress(self) -> Dict:
-        """Get overall transfer progress statistics."""
-        ready_count = self._total_layers_transferred
-        progress_pct = (ready_count / self.num_layers) * 100
-        elapsed_time = time.perf_counter() - self._transfer_start_time
-        
-        return {
-            "layers_ready": ready_count,
-            "total_layers": self.num_layers,
-            "progress_percent": progress_pct,
-            "elapsed_time_ms": elapsed_time * 1000,
-            "layers_per_second": ready_count / elapsed_time if elapsed_time > 0 else 0
-        }
-    
-    def reset(self) -> None:
-        """Reset all tracking state for a new transfer."""
-        self._layer_ready_flags = [False] * self.num_layers
-        self._layer_chunk_counts = [0] * self.num_layers
-        self._layer_ready_timestamps = [0.0] * self.num_layers
-        self._total_layers_transferred = 0
-        self._transfer_start_time = time.perf_counter()
-        
-        # Clear callbacks
-        with self._callback_lock:
-            for layer_callbacks in self._callbacks.values():
-                layer_callbacks.clear()
-    
-    def _fire_callbacks_async(self, layer_id: int) -> None:
-        """Fire callbacks in separate thread to avoid blocking critical path."""
-        def fire():
-            with self._callback_lock:
-                for callback in self._callbacks[layer_id]:
-                    try:
-                        callback(layer_id)
-                    except Exception as e:
-                        logger.error(f"Callback error for layer {layer_id}: {e}")
-        
-        threading.Thread(target=fire, daemon=True).start()
-
-
 class LMCacheEngine:
     """The main class for the cache engine. 
 
@@ -754,32 +530,33 @@ class LayerwiseLMCacheEngine(LMCacheEngine):
             chunk_metadata = []
             chunk_keys = []
             chunk_ranges = []  # Store (start, end) pairs
-            
+
             for start, end, base_key in token_chunks:
                 assert isinstance(base_key, CacheEngineKey)
-                
+
                 # Create layer-specific key
-                keys_multi_layer = base_key.split_layers(self.num_layers)[layer_id]
-                
+                keys_multi_layer = base_key.split_layers(
+                    self.num_layers)[layer_id]
+
                 # Skip if already cached
                 if self.storage_manager.contains(keys_multi_layer):
                     continue
-                
+
                 # Prepare metadata for this chunk
                 num_chunk_tokens = end - start
-                kv_shape_single_layer = self.gpu_connector.get_shape(num_chunk_tokens)
+                kv_shape_single_layer = self.gpu_connector.get_shape(
+                    num_chunk_tokens)
                 memobj_meta = self.storage_manager.dry_allocate(
                     kv_shape_single_layer,
                     self.metadata.kv_dtype,
-                    fmt=MemoryFormat.KV_T2D
-                )
-                
+                    fmt=MemoryFormat.KV_T2D)
+
                 if memobj_meta is None:
                     logger.warning(
                         f"Failed to prepare metadata for layer {layer_id}, "
                         f"chunk {start}:{end}")
                     continue
-                
+
                 chunk_metadata.append(memobj_meta)
                 chunk_keys.append(keys_multi_layer)
                 chunk_ranges.append((start, end))
@@ -791,9 +568,10 @@ class LayerwiseLMCacheEngine(LMCacheEngine):
 
             # Process chunks in batches
             for batch_start in range(0, len(chunk_ranges), self.batch_size):
-                batch_end = min(batch_start + self.batch_size, len(chunk_ranges))
+                batch_end = min(batch_start + self.batch_size,
+                                len(chunk_ranges))
                 logger.debug(f"Processing batch {batch_start}:{batch_end}")
-                
+
                 # Get the current batch
                 batch_ranges = chunk_ranges[batch_start:batch_end]
                 batch_keys = chunk_keys[batch_start:batch_end]
@@ -810,28 +588,27 @@ class LayerwiseLMCacheEngine(LMCacheEngine):
                 batch_ends = []
                 batch_memory_objs = []
                 batch_valid_keys = []
-                
-                for (start, end), keys_multi_layer, meta in zip(batch_ranges, batch_keys, batch_metadata):
+
+                for (start, end), keys_multi_layer, meta in zip(
+                        batch_ranges, batch_keys, batch_metadata):
                     t = time.perf_counter()
-                    mem_obj = self.storage_manager.allocate(
-                        meta.shape,
-                        meta.dtype,
-                        fmt=meta.fmt
-                    )
+                    mem_obj = self.storage_manager.allocate(meta.shape,
+                                                            meta.dtype,
+                                                            fmt=meta.fmt)
                     total_put_time += time.perf_counter() - t
-                    
+
                     if mem_obj is None:
                         logger.warning(
                             f"Failed to allocate memory for layer {layer_id}, "
                             f"chunk {start}:{end}")
                         continue
-                    
+
                     batch_starts.append(start)
                     batch_ends.append(end)
                     batch_memory_objs.append(mem_obj)
                     batch_valid_keys.append(keys_multi_layer)
                     total_kv_size += mem_obj.get_size()
-                    
+
                     # Update lookup server for this chunk
                     if self.lookup_server is not None:
                         self.lookup_server.insert(keys_multi_layer)
@@ -839,75 +616,76 @@ class LayerwiseLMCacheEngine(LMCacheEngine):
                 if batch_memory_objs:
                     # Transfer data for this batch
                     assert isinstance(self.gpu_connector,
-                                   VLLMPagedMemLayerwiseGPUConnector)
-                    
+                                      VLLMPagedMemLayerwiseGPUConnector)
+
                     # Create batch-specific kwargs by slicing relevant data
                     batch_kwargs = kwargs.copy()
                     if "slot_mapping" in kwargs:
                         slot_mapping = kwargs["slot_mapping"]
                         min_start = min(batch_starts)
                         max_end = max(batch_ends)
-                        batch_kwargs["slot_mapping"] = slot_mapping[min_start:max_end]
-                        
+                        batch_kwargs["slot_mapping"] = slot_mapping[
+                            min_start:max_end]
+
                         # Adjust starts and ends to be relative to the sliced slot_mapping
                         relative_starts = [s - min_start for s in batch_starts]
                         relative_ends = [e - min_start for e in batch_ends]
                     else:
                         relative_starts = batch_starts
                         relative_ends = batch_ends
-                    
+
                     # Create a single-layer generator for this batch
                     t = time.perf_counter()
                     mem_obj_generator = self.gpu_connector.batched_from_gpu(
-                        [batch_memory_objs],  # Wrap in list since we're doing one layer
+                        [batch_memory_objs
+                         ],  # Wrap in list since we're doing one layer
                         relative_starts,
                         relative_ends,
-                        **batch_kwargs
-                    )
-                    
+                        **batch_kwargs)
+
                     # Process the generator
                     next(mem_obj_generator)  # Initial setup and transfer data
                     total_offload_time += time.perf_counter() - t
-                    
+
                     # Store the batch's data in backend
                     t = time.perf_counter()
-                    self.storage_manager.batched_put(batch_valid_keys, batch_memory_objs)
+                    self.storage_manager.batched_put(batch_valid_keys,
+                                                     batch_memory_objs)
                     total_batch_put_time += time.perf_counter() - t
                     # Commit the put operation
                     self.storage_manager.commit_put()
                     total_put_time += time.perf_counter() - t
-            
+
             # Record layer time
             layer_time = time.perf_counter() - layer_st
             layerwise_times.append(layer_time)
-            
+
             # Yield after processing each layer
             yield
         # Calculate and print metrics
         ed = time.perf_counter()
         total_time = ed - st
-        avg_layer_time = sum(layerwise_times) / len(layerwise_times) if layerwise_times else 0
+        avg_layer_time = sum(layerwise_times) / len(
+            layerwise_times) if layerwise_times else 0
         max_layer_time = max(layerwise_times) if layerwise_times else 0
         min_layer_time = min(layerwise_times) if layerwise_times else 0
-        
+
         logger.info(
             "Store %d tokens takes: %.4f ms, throughput: %.4f GB/s; "
             "layerwise time (avg/max/min): %.4f/%.4f/%.4f ms; "
-            "offload_time: %.4f ms, put_time: %.4f ms", 
-            num_tokens,
-            total_time * 1000, 
-            total_kv_size / total_time / 1024**3,
-            avg_layer_time * 1000,
-            max_layer_time * 1000,
-            min_layer_time * 1000,
-            total_offload_time * 1000, 
+            "offload_time: %.4f ms, put_time: %.4f ms", num_tokens,
+            total_time * 1000, total_kv_size / total_time / 1024**3,
+            avg_layer_time * 1000, max_layer_time * 1000,
+            min_layer_time * 1000, total_offload_time * 1000,
             total_put_time * 1000)
-        logger.info(f"total prepare time: {total_prepare_time * 1000} ms; total put time (w/o prepare): {(total_put_time-total_prepare_time) * 1000} ms")
+        logger.info(
+            f"total prepare time: {total_prepare_time * 1000} ms; total put time (w/o prepare): {(total_put_time-total_prepare_time) * 1000} ms"
+        )
         logger.info(f"total batch put time: {total_batch_put_time * 1000} ms")
 
         self.stats_monitor.on_store_finished(monitor_req_id)
         logger.debug(f"Stored {num_tokens} "
-                    f"out of total {len(tokens)} tokens")
+                     f"out of total {len(tokens)} tokens")
         yield
 
     @_lmcache_nvtx_annotate
@@ -971,9 +749,10 @@ class LayerwiseLMCacheEngine(LMCacheEngine):
         if chunk_keys:
             # Process chunks in batches
             for batch_start in range(0, len(chunk_starts), self.batch_size):
-                batch_end = min(batch_start + self.batch_size, len(chunk_starts))
+                batch_end = min(batch_start + self.batch_size,
+                                len(chunk_starts))
                 logger.debug(f"Processing batch {batch_start}:{batch_end}")
-                
+
                 # Get the current batch
                 batch_starts = chunk_starts[batch_start:batch_end]
                 batch_ends = chunk_ends[batch_start:batch_end]
@@ -985,8 +764,9 @@ class LayerwiseLMCacheEngine(LMCacheEngine):
                     slot_mapping = kwargs["slot_mapping"]
                     min_start = min(batch_starts)
                     max_end = max(batch_ends)
-                    batch_kwargs["slot_mapping"] = slot_mapping[min_start:max_end]
-                    
+                    batch_kwargs["slot_mapping"] = slot_mapping[
+                        min_start:max_end]
+
                     # Adjust starts and ends to be relative to the sliced slot_mapping
                     relative_starts = [s - min_start for s in batch_starts]
                     relative_ends = [e - min_start for e in batch_ends]
@@ -996,7 +776,7 @@ class LayerwiseLMCacheEngine(LMCacheEngine):
 
                 # Set up the consumer for this batch
                 assert isinstance(self.gpu_connector,
-                               VLLMPagedMemLayerwiseGPUConnector)
+                                  VLLMPagedMemLayerwiseGPUConnector)
                 mem_obj_consumer = self.gpu_connector.batched_to_gpu(
                     relative_starts, relative_ends, **batch_kwargs)
                 next(mem_obj_consumer)  # Initial setup
@@ -1005,26 +785,31 @@ class LayerwiseLMCacheEngine(LMCacheEngine):
                 batch_memory_objs = []
                 for layer_id in range(self.num_layers):
                     # Extract keys for current layer from each chunk
-                    layer_keys = [chunk_keys[layer_id] for chunk_keys in batch_keys]
-                    
+                    layer_keys = [
+                        chunk_keys[layer_id] for chunk_keys in batch_keys
+                    ]
+
                     # Get memory objects for current layer
-                    get_generator = self.storage_manager.layerwise_batched_get([layer_keys])
+                    get_generator = self.storage_manager.layerwise_batched_get(
+                        [layer_keys])
                     get_tasks = next(get_generator)
                     assert None not in get_tasks
-                    
+
                     yield None  # Allow cooperative multitasking
 
                     # Get results and send to consumer
-                    layer_memory_objs = [retrieve_task.result() for retrieve_task in get_tasks]
+                    layer_memory_objs = [
+                        retrieve_task.result() for retrieve_task in get_tasks
+                    ]
                     mem_obj_consumer.send(layer_memory_objs)
                     batch_memory_objs.extend(layer_memory_objs)
-                    
+
                     # Unpin the current layer's keys
                     self.storage_manager.batched_unpin(layer_keys)
 
                 # Final sync for this batch
                 next(mem_obj_consumer)
-                
+
                 # Clean up memory objects for this batch
                 for mem_obj in batch_memory_objs:
                     mem_obj.ref_count_down()
@@ -1044,10 +829,10 @@ class LayerwiseLMCacheEngine(LMCacheEngine):
 
         retrieved_tokens = torch.sum(ret_mask)
         self.stats_monitor.on_retrieve_finished(monitor_req_id,
-                                              retrieved_tokens)
+                                                retrieved_tokens)
         logger.debug(f"Retrieved {retrieved_tokens} "
-                    f"out of {num_tokens} "
-                    f"out of total {len(tokens)} tokens")
+                     f"out of {num_tokens} "
+                     f"out of total {len(tokens)} tokens")
 
         yield ret_mask
 
@@ -1084,6 +869,7 @@ class LayerwiseLMCacheEngine(LMCacheEngine):
                     return start
         return end
 
+
 class LayerAwareLMCacheEngine(LMCacheEngine):
     """
     A specialized cache engine that handles layer-aware caching for disaggregated inference.
@@ -1109,27 +895,16 @@ class LayerAwareLMCacheEngine(LMCacheEngine):
         gpu_connector: GPUConnectorInterface,
         layerwise: bool = True,
     ):
-        super().__init__(config, metadata, memory_allocator, token_database, 
+        super().__init__(config, metadata, memory_allocator, token_database,
                          gpu_connector, layerwise)
         self.num_layers = metadata.kv_shape[0]
-        
-        nixl_channel = self.storage_manager.storage_backend._nixl_channel
-        from lmcache.experimental.storage_backend.connector.nixl_utils import NixlRole
-        if nixl_channel.nixl_config.role == NixlRole.RECEIVER:
-            nixl_channel.unregister_receive_observer(self.storage_manager.storage_backend._nixl_observer)
 
-            self.layer_status = LayerAwareNixlObserver(self.num_layers, self.storage_manager.storage_backend._obj_pool)
-            nixl_channel.register_receive_observer(self.layer_status)
-
-            logger.info("Registered LayerAwareNixlObserver with NixlBackend for RDMA layer tracking")
-        
     @_lmcache_nvtx_annotate
     @torch.inference_mode()
     def _group_keys_by_layers_first(
-        self, 
-        tokens: torch.Tensor, 
-        mask: Optional[torch.Tensor] = None
-    ) -> Dict[int, List[tuple]]:
+            self,
+            tokens: torch.Tensor,
+            mask: Optional[torch.Tensor] = None) -> Dict[int, List[tuple]]:
         """
         Group layer keys by layer-first order for progressive transfer.
         
@@ -1137,38 +912,35 @@ class LayerAwareLMCacheEngine(LMCacheEngine):
             Dict mapping layer_id -> [(start, end, layer_key), ...]
         """
         layers_data = {}
-        
+
         # Add fine-grained profiling for the generator loop
         with NVTXContext("token_processing_setup"):
             token_processor = self.token_database.process_tokens(tokens, mask)
-        
+
         iteration_count = 0
         for start, end, layer_key in token_processor:
             with NVTXContext(f"process_token_chunk_{iteration_count}"):
                 assert isinstance(layer_key, LayerCacheEngineKey)
-                
+
                 layer_id = layer_key.layer_id
                 if layer_id not in layers_data:
                     layers_data[layer_id] = []
-                
+
                 layers_data[layer_id].append((start, end, layer_key))
                 iteration_count += 1
-        
+
         return layers_data
 
     @_lmcache_nvtx_annotate
     @torch.inference_mode()
     def _get_layer_keys_for_single_layer(
-        self, 
-        layer_id: int,
-        tokens: torch.Tensor, 
-        mask: Optional[torch.Tensor] = None
-    ) -> List[tuple]:
+            self,
+            layer_id: int,
+            tokens: torch.Tensor,
+            mask: Optional[torch.Tensor] = None) -> List[tuple]:
         """
         Get layer keys for a specific layer only, avoiding unnecessary computation.
         
-        This is more efficient than _group_keys_by_layers_first when only one layer is needed,
-        as it avoids processing tokens for all layers.
         
         Args:
             layer_id: The specific layer ID to get keys for
@@ -1179,34 +951,27 @@ class LayerAwareLMCacheEngine(LMCacheEngine):
             List of (start, end, layer_key) tuples for the specified layer only
         """
         layer_chunks = []
-        
-        # Check if token_database supports layer-specific processing
-        if hasattr(self.token_database, 'process_tokens_for_layer'):
-            # Use the optimized layer-specific method
-            with NVTXContext("token_processing_setup_single_layer"):
-                token_processor = self.token_database.process_tokens_for_layer(tokens, layer_id, mask)
-            
-            for start, end, layer_key in token_processor:
-                with NVTXContext(f"process_token_chunk_layer_{layer_id}"):
-                    assert isinstance(layer_key, LayerCacheEngineKey)
-                    assert layer_key.layer_id == layer_id
-                    layer_chunks.append((start, end, layer_key))
-        else:
-            # Fallback to the original method and filter
-            layers_data = self._group_keys_by_layers_first(tokens, mask)
-            layer_chunks = layers_data.get(layer_id, [])
-        
+
+        # Use the optimized layer-specific method
+        with NVTXContext("token_processing_setup_single_layer"):
+            token_processor = self.token_database.process_tokens_for_layer(
+                tokens, layer_id, mask)
+
+        for start, end, layer_key in token_processor:
+            with NVTXContext(f"process_token_chunk_layer_{layer_id}"):
+                assert isinstance(layer_key, LayerCacheEngineKey)
+                assert layer_key.layer_id == layer_id
+                layer_chunks.append((start, end, layer_key))
+
         return layer_chunks
 
     @_lmcache_nvtx_annotate
     @torch.inference_mode()
-    def store_progressive_layers(
-        self,
-        tokens: torch.Tensor,
-        mask: Optional[torch.Tensor] = None,
-        layer_ids: Optional[List[int]] = None,
-        **kwargs
-    ) -> None:
+    def store_progressive_layers(self,
+                                 tokens: torch.Tensor,
+                                 mask: Optional[torch.Tensor] = None,
+                                 layer_ids: Optional[List[int]] = None,
+                                 **kwargs) -> None:
         """
         Store KV cache data for specific layers with RDMA-aware zero-copy transfers.
         
@@ -1229,53 +994,59 @@ class LayerAwareLMCacheEngine(LMCacheEngine):
         else:
             num_tokens = len(tokens)
         monitor_req_id = self.stats_monitor.on_store_request(num_tokens)
-        
+
         # Get layer-first grouped data
         layers_data = self._group_keys_by_layers_first(tokens, mask)
         if not layers_data:
             logger.warning("No layer data to store")
             self.stats_monitor.on_store_finished(monitor_req_id)
             return
-            
+
         # Determine which layers to process
         if layer_ids is None:
             layer_ids = sorted(layers_data.keys())
         else:
-                # Validate layer IDs
-                for layer_id in layer_ids:
-                    if layer_id < 0 or layer_id >= self.num_layers:
-                        raise ValueError(f"Invalid layer ID: {layer_id}")
-                    if layer_id not in layers_data:
-                        logger.warning(f"No data for layer {layer_id}")
-                        
+            # Validate layer IDs
+            for layer_id in layer_ids:
+                if layer_id < 0 or layer_id >= self.num_layers:
+                    raise ValueError(f"Invalid layer ID: {layer_id}")
+                if layer_id not in layers_data:
+                    logger.warning(f"No data for layer {layer_id}")
+
         # Determine memory format based on GPU connector type
         memory_format = self._get_memory_format_for_connector()
-        
+
         # Check if we're using NixlBackend for RDMA
-        using_nixl = isinstance(self.storage_manager, DistributedStorageManager)
-        
+        using_nixl = isinstance(self.storage_manager,
+                                DistributedStorageManager)
+
         total_stored = 0
         layer_timings = {}
-        
+
         # Process layers progressively: layer-0, then layer-1, etc.
         # Each layer gets its own register->flush cycle for true pipelining
         for layer_id in layer_ids:
             layer_stored = self._store_single_layer_progressive(
-                layer_id, layers_data[layer_id], memory_format, using_nixl, **kwargs
-            )
-            
+                layer_id, layers_data[layer_id], memory_format, using_nixl,
+                **kwargs)
+
             total_stored += layer_stored
-            
+
         ed = time.perf_counter()
         total_time = ed - st
-        
-        logger.info(f"Progressive layer store completed: {total_stored} chunks across "
-                   f"{len(layer_ids)} layers in {total_time*1000:.2f}ms")
-        logger.info(f"Using {'RDMA zero-copy' if using_nixl else 'standard'} transfer with {memory_format}")
-        
+
+        logger.info(
+            f"Progressive layer store completed: {total_stored} chunks across "
+            f"{len(layer_ids)} layers in {total_time*1000:.2f}ms")
+        logger.info(
+            f"Using {'RDMA zero-copy' if using_nixl else 'standard'} transfer with {memory_format}"
+        )
+
         if using_nixl:
-            logger.info("Layer readiness tracking via NixlObserver - layers will be marked ready when data is received")
-        
+            logger.info(
+                "Layer readiness tracking via NixlObserver - layers will be marked ready when data is received"
+            )
+
         self.stats_monitor.on_store_finished(monitor_req_id)
 
     def _get_memory_format_for_connector(self) -> MemoryFormat:
@@ -1295,14 +1066,10 @@ class LayerAwareLMCacheEngine(LMCacheEngine):
 
     @_lmcache_nvtx_annotate
     @torch.inference_mode()
-    def _store_single_layer_progressive(
-        self,
-        layer_id: int,
-        layer_chunks: List[tuple],
-        memory_format: MemoryFormat,
-        using_nixl: bool,
-        **kwargs
-    ) -> int:
+    def _store_single_layer_progressive(self, layer_id: int,
+                                        layer_chunks: List[tuple],
+                                        memory_format: MemoryFormat,
+                                        using_nixl: bool, **kwargs) -> int:
         """
         Store a single layer with progressive transfer capability.
         
@@ -1321,31 +1088,31 @@ class LayerAwareLMCacheEngine(LMCacheEngine):
         """
         layer_st = time.perf_counter()
         layer_stored = 0
-        
-        logger.debug(f"Processing layer {layer_id} with {len(layer_chunks)} chunks "
-                    f"using {memory_format} format")
-        
+
+        logger.debug(
+            f"Processing layer {layer_id} with {len(layer_chunks)} chunks "
+            f"using {memory_format} format")
+
         if using_nixl:
             # RDMA path: each layer gets its own register->flush cycle
-            layer_stored = self._store_layer_rdma(layer_id, layer_chunks, memory_format, **kwargs)
+            layer_stored = self._store_layer_rdma(layer_id, layer_chunks,
+                                                  memory_format, **kwargs)
         else:
             # Standard path: direct allocation and transfer
-            layer_stored = self._store_layer_standard(layer_id, layer_chunks, memory_format, **kwargs)
-        
+            layer_stored = self._store_layer_standard(layer_id, layer_chunks,
+                                                      memory_format, **kwargs)
+
         layer_time = time.perf_counter() - layer_st
-        logger.debug(f"Layer {layer_id} completed: {layer_stored} chunks in {layer_time*1000:.2f}ms")
-        
+        logger.debug(
+            f"Layer {layer_id} completed: {layer_stored} chunks in {layer_time*1000:.2f}ms"
+        )
+
         return layer_stored
 
     @_lmcache_nvtx_annotate
     @torch.inference_mode()
-    def _store_layer_rdma(
-        self,
-        layer_id: int,
-        layer_chunks: List[tuple],
-        memory_format: MemoryFormat,
-        **kwargs
-    ) -> int:
+    def _store_layer_rdma(self, layer_id: int, layer_chunks: List[tuple],
+                          memory_format: MemoryFormat, **kwargs) -> int:
         """
         Store a single layer using RDMA zero-copy transfers.
         
@@ -1365,96 +1132,96 @@ class LayerAwareLMCacheEngine(LMCacheEngine):
         layer_keys = []
         layer_metadata = []
         valid_chunks = []
-        
+
         # First pass: prepare metadata for all chunks in this layer
         for start, end, layer_key in layer_chunks:
             if self.storage_manager.contains(layer_key):
                 continue
-                
+
             # Get chunk-specific KV cache shape
             num_chunk_tokens = end - start
             kv_shape = self.gpu_connector.get_shape(num_chunk_tokens)
             kv_dtype = self.metadata.kv_dtype
-            
+
             # Prepare metadata with correct format
             metadata = self.storage_manager.dry_allocate(
                 kv_shape,
                 kv_dtype,
-                fmt=memory_format  # Use KV_T2D for VLLMPagedMemLayerwiseGPUConnector
+                fmt=
+                memory_format  # Use KV_T2D for VLLMPagedMemLayerwiseGPUConnector
             )
-            
+
             layer_keys.append(layer_key)
             layer_metadata.append(metadata)
             valid_chunks.append((start, end, layer_key))
-        
+
         if not layer_keys:
             return 0
-            
+
         # Register this layer's operations (each layer gets its own register->flush cycle)
-        logger.debug(f"Registering RDMA operations for layer {layer_id}: {len(layer_keys)} chunks")
+        logger.debug(
+            f"Registering RDMA operations for layer {layer_id}: {len(layer_keys)} chunks"
+        )
         self.storage_manager.prepare_put(layer_keys, layer_metadata)
-        
+
         # Second pass: allocate zero-copy memory for all chunks in this layer
         memory_objs = []
         successful_keys = []
         starts = []
         ends = []
-        
+
         for i, (start, end, layer_key) in enumerate(valid_chunks):
             metadata = layer_metadata[i]
-            
+
             # Allocate zero-copy memory
-            memory_obj = self.storage_manager.allocate(
-                metadata.shape,
-                metadata.dtype,
-                fmt=metadata.fmt
-            )
-            
+            memory_obj = self.storage_manager.allocate(metadata.shape,
+                                                       metadata.dtype,
+                                                       fmt=metadata.fmt)
+
             if memory_obj is None:
-                logger.warning(f"Failed to allocate zero-copy memory for layer {layer_id}, "
-                             f"chunk {start}:{end}")
+                logger.warning(
+                    f"Failed to allocate zero-copy memory for layer {layer_id}, "
+                    f"chunk {start}:{end}")
                 continue
-            
+
             # Collect for batch transfer
             memory_objs.append(memory_obj)
             successful_keys.append(layer_key)
             starts.append(start)
             ends.append(end)
-            
+
             # Update lookup server
             if self.lookup_server is not None:
                 self.lookup_server.insert(layer_key)
-        
+
         # Batch transfer data FROM GPU TO memory objects
         if memory_objs:
-            logger.debug(f"Batch transferring {len(memory_objs)} chunks FROM GPU for layer {layer_id}")
-            
+            logger.debug(
+                f"Batch transferring {len(memory_objs)} chunks FROM GPU for layer {layer_id}"
+            )
+
             # Use the simpler single-layer method instead of complex generator
             assert isinstance(self.gpu_connector, VLLMPagedMemLayerwiseGPUConnector), \
                 "from_gpu_single_layer method requires VLLMPagedMemLayerwiseGPUConnector"
-            
-            self.gpu_connector.from_gpu_single_layer(
-                memory_objs, starts, ends, layer_id, **kwargs
-            )
-        
+
+            self.gpu_connector.from_gpu_single_layer(memory_objs, starts, ends,
+                                                     layer_id, **kwargs)
+
         # Batch put all memory objects for this layer at once
         if memory_objs:
-            logger.debug(f"Batch putting {len(memory_objs)} memory objects for layer {layer_id}")
+            logger.debug(
+                f"Batch putting {len(memory_objs)} memory objects for layer {layer_id}"
+            )
             self.storage_manager.batched_put(successful_keys, memory_objs)
-        
+
         # Flush this layer's RDMA operations
         logger.debug(f"Flushing RDMA operations for layer {layer_id}")
         self.storage_manager.commit_put()
-        
+
         return len(memory_objs)
 
-    def _store_layer_standard(
-        self,
-        layer_id: int,
-        layer_chunks: List[tuple],
-        memory_format: MemoryFormat,
-        **kwargs
-    ) -> int:
+    def _store_layer_standard(self, layer_id: int, layer_chunks: List[tuple],
+                              memory_format: MemoryFormat, **kwargs) -> int:
         """
         Store a single layer using standard (non-RDMA) transfers.
         """
@@ -1463,67 +1230,69 @@ class LayerAwareLMCacheEngine(LMCacheEngine):
         successful_keys = []
         starts = []
         ends = []
-        
+
         # Process all chunks for this layer
         for start, end, layer_key in layer_chunks:
             if self.storage_manager.contains(layer_key):
                 continue
-                
+
             # Get chunk-specific KV cache shape
             num_chunk_tokens = end - start
             kv_shape = self.gpu_connector.get_shape(num_chunk_tokens)
             kv_dtype = self.metadata.kv_dtype
-            
+
             # Allocate memory with correct format
-            memory_obj = self.storage_manager.allocate(kv_shape, kv_dtype, fmt=memory_format)
-            
+            memory_obj = self.storage_manager.allocate(kv_shape,
+                                                       kv_dtype,
+                                                       fmt=memory_format)
+
             if memory_obj is None:
-                logger.warning(f"Failed to allocate memory for layer {layer_id}, "
-                             f"chunk {start}:{end}")
+                logger.warning(
+                    f"Failed to allocate memory for layer {layer_id}, "
+                    f"chunk {start}:{end}")
                 continue
-            
+
             # Collect for batch transfer
             memory_objs.append(memory_obj)
             successful_keys.append(layer_key)
             starts.append(start)
             ends.append(end)
-            
+
             # Update lookup server
             if self.lookup_server is not None:
                 self.lookup_server.insert(layer_key)
-        
+
         # Batch transfer data from GPU to memory objects
         if memory_objs:
-            logger.debug(f"Batch transferring {len(memory_objs)} chunks from GPU for layer {layer_id}")
-            
+            logger.debug(
+                f"Batch transferring {len(memory_objs)} chunks from GPU for layer {layer_id}"
+            )
+
             # Format memory_objs for batched_from_gpu: List[List[MemoryObj]]
             # Since we're processing one layer, we need [memory_objs] (layer dimension)
             memory_objs_batched = [memory_objs]
-            
+
             # Use batched GPU transfer
             gpu_generator = self.gpu_connector.batched_from_gpu(
-                memory_objs_batched, starts, ends, **kwargs
-            )
-            
+                memory_objs_batched, starts, ends, **kwargs)
+
             # Execute the generator (first call sets up, second call transfers this layer)
             next(gpu_generator)  # Setup
             next(gpu_generator)  # Transfer layer data
-            
+
             # Batch put all memory objects
             self.storage_manager.batched_put(successful_keys, memory_objs)
-                
+
         return len(memory_objs)
 
-    @_lmcache_nvtx_annotate 
+    @_lmcache_nvtx_annotate
     @torch.inference_mode()
-    def retrieve_layer_when_ready(
-        self,
-        layer_id: int,
-        tokens: torch.Tensor,
-        mask: Optional[torch.Tensor] = None,
-        timeout_us: int = 1000,
-        **kwargs
-    ) -> Optional[torch.Tensor]:
+    def retrieve_layer_when_ready(self,
+                                  layer_id: int,
+                                  tokens: torch.Tensor,
+                                  mask: Optional[torch.Tensor] = None,
+                                  timeout_us: int = 1000,
+                                  **kwargs) -> Optional[torch.Tensor]:
         """
         Retrieve layer data as soon as it becomes ready.
         
@@ -1538,7 +1307,8 @@ class LayerAwareLMCacheEngine(LMCacheEngine):
             Boolean mask indicating which tokens were retrieved, or None if timeout
         """
         # Wait for layer to be ready with microsecond precision
-        if not self.layer_status.wait_for_layer_busy(layer_id, timeout_us):
+        if not self.storage_manager.storage_backend.wait_for_layer_busy(
+                layer_id, timeout_us):
             logger.debug(f"Layer {layer_id} not ready within {timeout_us}μs")
             return None
 
@@ -1550,53 +1320,63 @@ class LayerAwareLMCacheEngine(LMCacheEngine):
         monitor_req_id = self.stats_monitor.on_retrieve_request(num_tokens)
 
         # Check if we're using NixlBackend for RDMA
-        using_nixl = isinstance(self.storage_manager, DistributedStorageManager)
-        
+        using_nixl = isinstance(self.storage_manager,
+                                DistributedStorageManager)
+
         # Determine memory format based on GPU connector type
         memory_format = self._get_memory_format_for_connector()
 
         # Get layer-specific chunks using optimized single-layer processing
-        layer_chunks = self._get_layer_keys_for_single_layer(layer_id, tokens, mask)
+        layer_chunks = self._get_layer_keys_for_single_layer(
+            layer_id, tokens, mask)
         if not layer_chunks:
             logger.debug(f"No data for layer {layer_id}")
             self.stats_monitor.on_retrieve_finished(monitor_req_id, 0)
             return None
-        
+
         # Retrieve data using the appropriate method
         if using_nixl:
-            ret_mask = self._retrieve_layer_rdma(layer_id, layer_chunks, memory_format, **kwargs)
+            ret_mask = self._retrieve_layer_rdma(layer_id, layer_chunks,
+                                                 memory_format, **kwargs)
         else:
-            ret_mask = self._retrieve_layer_standard(layer_id, layer_chunks, memory_format, **kwargs)
+            ret_mask = self._retrieve_layer_standard(layer_id, layer_chunks,
+                                                     memory_format, **kwargs)
 
         ed = time.perf_counter()
-        retrieved_tokens = torch.sum(ret_mask).item() if ret_mask is not None else 0
-        
-        logger.debug(f"Layer {layer_id} retrieved: {retrieved_tokens} tokens "
-                    f"in {(ed-st)*1000:.2f}ms using {'RDMA' if using_nixl else 'standard'} transfer")
-        
-        self.stats_monitor.on_retrieve_finished(monitor_req_id, retrieved_tokens)
+        retrieved_tokens = torch.sum(
+            ret_mask).item() if ret_mask is not None else 0
+
+        logger.debug(
+            f"Layer {layer_id} retrieved: {retrieved_tokens} tokens "
+            f"in {(ed-st)*1000:.2f}ms using {'RDMA' if using_nixl else 'standard'} transfer"
+        )
+
+        self.stats_monitor.on_retrieve_finished(monitor_req_id,
+                                                retrieved_tokens)
         return ret_mask
 
-    def get_layer_readiness_status(self) -> Dict:
-        """Get comprehensive layer readiness status."""
-        ready_layers = self.layer_status.get_ready_layers()
-        transfer_progress = self.layer_status.get_transfer_progress()
-        
-        layer_stats = {}
-        for layer_id in range(self.num_layers):
-            layer_stats[layer_id] = self.layer_status.get_layer_stats(layer_id)
-        
-        return {
-            "ready_layers": ready_layers,
-            "transfer_progress": transfer_progress,
-            "layer_stats": layer_stats
-        }
+    # def get_layer_readiness_status(self) -> Dict:
+    #     """Get comprehensive layer readiness status."""
+    #     ready_layers = self.layer_status.get_ready_layers()
+    #     transfer_progress = self.layer_status.get_transfer_progress()
 
-    def register_layer_ready_callback(self, layer_id: int, callback: Callable[[int], None]) -> None:
-        """Register callback for when specific layer becomes ready."""
-        self.layer_status.register_callback(layer_id, callback)
+    #     layer_stats = {}
+    #     for layer_id in range(self.num_layers):
+    #         layer_stats[layer_id] = self.layer_status.get_layer_stats(layer_id)
 
-    def wait_for_early_layers(self, num_layers: int = 1, timeout_us: int = 5000) -> List[int]:
+    #     return {
+    #         "ready_layers": ready_layers,
+    #         "transfer_progress": transfer_progress,
+    #         "layer_stats": layer_stats
+    #     }
+
+    # def register_layer_ready_callback(self, layer_id: int, callback: Callable[[int], None]) -> None:
+    #     """Register callback for when specific layer becomes ready."""
+    #     self.layer_status.register_callback(layer_id, callback)
+
+    def wait_for_early_layers(self,
+                              num_layers: int = 1,
+                              timeout_us: int = 5000) -> List[int]:
         """
         Wait for early layers to become ready for immediate processing.
         
@@ -1608,13 +1388,12 @@ class LayerAwareLMCacheEngine(LMCacheEngine):
             List of ready layer IDs
         """
         early_layers = list(range(min(num_layers, self.num_layers)))
-        return self.layer_status.wait_for_layers_batch(early_layers, timeout_us)
+        return self.storage_manager.storage_backend.wait_for_layers_batch(
+            early_layers, timeout_us)
 
-    def signal_layers_ready(
-        self,
-        layer_ids: List[int],
-        chunk_counts: Optional[List[int]] = None
-    ) -> None:
+    def signal_layers_ready(self,
+                            layer_ids: List[int],
+                            chunk_counts: Optional[List[int]] = None) -> None:
         """
         Manually signal that specific layers are ready for consumption.
         
@@ -1630,15 +1409,18 @@ class LayerAwareLMCacheEngine(LMCacheEngine):
             chunk_counts = [1] * len(layer_ids)
         elif len(chunk_counts) != len(layer_ids):
             raise ValueError("chunk_counts length must match layer_ids length")
-            
+
         for layer_id, chunk_count in zip(layer_ids, chunk_counts):
             if layer_id < 0 or layer_id >= self.num_layers:
                 logger.warning(f"Invalid layer_id {layer_id}, skipping")
                 continue
-                
-            self.layer_status.mark_layer_ready(layer_id, chunk_count)
-            logger.debug(f"Manually signaled layer {layer_id} ready with {chunk_count} chunks")
-        
+
+            self.storage_manager.storage_backend.mark_layer_ready(
+                layer_id, chunk_count)
+            logger.debug(
+                f"Manually signaled layer {layer_id} ready with {chunk_count} chunks"
+            )
+
         logger.info(f"Signaled {len(layer_ids)} layers as ready")
 
     def signal_all_layers_ready(self) -> None:
@@ -1652,13 +1434,10 @@ class LayerAwareLMCacheEngine(LMCacheEngine):
         self.signal_layers_ready(layer_ids)
         logger.info(f"Signaled all {self.num_layers} layers as ready")
 
-    def _retrieve_layer_standard(
-        self,
-        layer_id: int,
-        layer_chunks: List[tuple],
-        memory_format: MemoryFormat,
-        **kwargs
-    ) -> Optional[torch.Tensor]:
+    def _retrieve_layer_standard(self, layer_id: int,
+                                 layer_chunks: List[tuple],
+                                 memory_format: MemoryFormat,
+                                 **kwargs) -> Optional[torch.Tensor]:
         """
         Retrieve a single layer using standard (non-RDMA) transfers.
         
@@ -1674,66 +1453,68 @@ class LayerAwareLMCacheEngine(LMCacheEngine):
         memory_objs = []
         successful_ranges = []
         tokens_length = None
-        
+
         # Collect all memory objects for this layer
         for start, end, layer_key in layer_chunks:
             if tokens_length is None:
                 # Infer tokens length from the first chunk
                 tokens_length = max(end for _, end, _ in layer_chunks)
-            
+
             memory_obj = self.storage_manager.get(layer_key)
             if memory_obj is not None:
                 memory_objs.append(memory_obj)
                 successful_ranges.append((start, end))
-        
+
         if not memory_objs:
             logger.debug(f"No memory objects found for layer {layer_id}")
             return None
-        
+
         # Create return mask
         ret_mask = torch.zeros(tokens_length, dtype=torch.bool, device="cpu")
-        
+
         # Transfer data to GPU using single layer method if possible, otherwise use generator
         if memory_objs:
-            logger.debug(f"Transferring {len(memory_objs)} chunks to GPU for layer {layer_id}")
-            
+            logger.debug(
+                f"Transferring {len(memory_objs)} chunks to GPU for layer {layer_id}"
+            )
+
             # Prepare arguments for single layer GPU transfer
             starts = [start for start, end in successful_ranges]
             ends = [end for start, end in successful_ranges]
-            
+
             # Use direct method if available, otherwise fall back to generator
-            if isinstance(self.gpu_connector, VLLMPagedMemLayerwiseGPUConnector):
-                self.gpu_connector.to_gpu_single_layer(
-                    memory_objs, starts, ends, layer_id, **kwargs)
+            if isinstance(self.gpu_connector,
+                          VLLMPagedMemLayerwiseGPUConnector):
+                self.gpu_connector.to_gpu_single_layer(memory_objs, starts,
+                                                       ends, layer_id,
+                                                       **kwargs)
             else:
                 # Fallback to generator pattern for other connector types
-                gpu_generator = self.gpu_connector.batched_to_gpu(starts, ends, **kwargs)
+                gpu_generator = self.gpu_connector.batched_to_gpu(
+                    starts, ends, **kwargs)
                 next(gpu_generator)  # Setup and prepare metadata
-                gpu_generator.send(memory_objs)  # Send memory objects for this layer
+                gpu_generator.send(
+                    memory_objs)  # Send memory objects for this layer
                 try:
                     next(gpu_generator)  # Complete the transfer
                 except StopIteration:
                     pass  # Generator finished
-            
+
             # Mark tokens as retrieved
             for start, end in successful_ranges:
                 ret_mask[start:end] = True
-            
+
             # Cleanup memory objects
             for memory_obj in memory_objs:
                 memory_obj.ref_count_down()
-                
+
         return ret_mask
 
     @_lmcache_nvtx_annotate
     @torch.inference_mode()
-    def _retrieve_layer_rdma(
-        self,
-        layer_id: int,
-        layer_chunks: List[tuple],
-        memory_format: MemoryFormat,
-        **kwargs
-    ) -> Optional[torch.Tensor]:
+    def _retrieve_layer_rdma(self, layer_id: int, layer_chunks: List[tuple],
+                             memory_format: MemoryFormat,
+                             **kwargs) -> Optional[torch.Tensor]:
         """
         Retrieve a single layer using RDMA zero-copy transfers.
         
@@ -1749,49 +1530,52 @@ class LayerAwareLMCacheEngine(LMCacheEngine):
         memory_objs = []
         successful_ranges = []
         tokens_length = None
-        
+
         # Collect all memory objects for this layer
         for start, end, layer_key in layer_chunks:
             if tokens_length is None:
                 # Infer tokens length from the first chunk
                 tokens_length = max(end for _, end, _ in layer_chunks)
-            
+
             memory_obj = self.storage_manager.get(layer_key)
             if memory_obj is not None:
                 memory_objs.append(memory_obj)
                 successful_ranges.append((start, end))
-        
+
         if not memory_objs:
             logger.debug(f"No memory objects found for layer {layer_id}")
             return None
-        
+
         # Create return mask
         ret_mask = torch.zeros(tokens_length, dtype=torch.bool, device="cpu")
-        
+
         # Transfer data TO GPU using the simplified single-layer method
         if memory_objs:
-            logger.debug(f"Transferring {len(memory_objs)} chunks TO GPU for layer {layer_id}")
-            
+            logger.debug(
+                f"Transferring {len(memory_objs)} chunks TO GPU for layer {layer_id}"
+            )
+
             # Prepare arguments for single layer GPU transfer
             starts = [start for start, end in successful_ranges]
             ends = [end for start, end in successful_ranges]
-            
+
             # Use the new to_gpu_single_layer method for direct transfer
             assert isinstance(self.gpu_connector, VLLMPagedMemLayerwiseGPUConnector), \
                 "to_gpu_single_layer method requires VLLMPagedMemLayerwiseGPUConnector"
-            
-            self.gpu_connector.to_gpu_single_layer(
-                memory_objs, starts, ends, layer_id, **kwargs)
-            
+
+            self.gpu_connector.to_gpu_single_layer(memory_objs, starts, ends,
+                                                   layer_id, **kwargs)
+
             # Mark tokens as retrieved
             for start, end in successful_ranges:
                 ret_mask[start:end] = True
-            
+
             # Cleanup memory objects
             for memory_obj in memory_objs:
                 memory_obj.ref_count_down()
-        
+
         return ret_mask
+
 
 class LMCacheEngineBuilder:
     _instances: Dict[str, LMCacheEngine] = {}
