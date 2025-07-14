@@ -41,7 +41,6 @@ from lmcache.usage_context import InitializeUsageContext
 from lmcache.utils import CacheEngineKey, LayerCacheEngineKey, CombinedLayerCacheEngineKey, _lmcache_nvtx_annotate, NVTXContext
 from lmcache.experimental.storage_backend.connector.nixl_connector_v2 import NixlObserverInterface
 
-
 ## TODO: remove this after nvtx is fixed
 from nvtx import annotate  # type: ignore
 from lmcache.utils import _get_color_for_nvtx
@@ -932,7 +931,7 @@ class LayerAwareLMCacheEngine(LMCacheEngine):
             Dict mapping layer_id -> [(start, end, layer_key), ...]
         """
         from concurrent.futures import ThreadPoolExecutor, as_completed
-        
+
         layers_data = {}
 
         # Check if we have a LayerFirstTokenDataBase with the optimized method
@@ -944,25 +943,26 @@ class LayerAwareLMCacheEngine(LMCacheEngine):
                     layer_chunks = []
                     token_processor = self.token_database.process_tokens_for_layer(
                         tokens, layer_id, mask)
-                    
+
                     for start, end, layer_key in token_processor:
                         assert isinstance(layer_key, LayerCacheEngineKey)
                         layer_chunks.append((start, end, layer_key))
-                    
+
                     return layer_id, layer_chunks
-            
+
             # Determine number of workers based on layer count
             num_workers = min(4, self.num_layers)  # Max 4 workers
-            
+
             with NVTXContext("parallel_layer_processing"):
                 with ThreadPoolExecutor(max_workers=num_workers) as executor:
                     # Submit all layers for parallel processing
                     future_to_layer = {}
                     for layer_id in range(self.num_layers):
                         with NVTXContext(f"submit_layer_{layer_id}"):
-                            future = executor.submit(process_single_layer, layer_id)
+                            future = executor.submit(process_single_layer,
+                                                     layer_id)
                             future_to_layer[future] = layer_id
-                    
+
                     # Collect results as they complete
                     for future in as_completed(future_to_layer):
                         layer_id = future_to_layer[future]
@@ -973,7 +973,8 @@ class LayerAwareLMCacheEngine(LMCacheEngine):
         else:
             # Fallback to original sequential processing for other token databases
             with NVTXContext("token_processing_setup"):
-                token_processor = self.token_database.process_tokens(tokens, mask)
+                token_processor = self.token_database.process_tokens(
+                    tokens, mask)
 
             iteration_count = 0
             for start, end, layer_key in token_processor:
@@ -1079,7 +1080,6 @@ class LayerAwareLMCacheEngine(LMCacheEngine):
                                 DistributedStorageManager)
 
         total_stored = 0
-        layer_timings = {}
 
         # Process layers progressively: layer-0, then layer-1, etc.
         # Each layer gets its own register->flush cycle for true pipelining
@@ -1156,9 +1156,7 @@ class LayerAwareLMCacheEngine(LMCacheEngine):
             layer_stored = self._store_layer_rdma(layer_id, layer_chunks,
                                                   memory_format, **kwargs)
         else:
-            # Standard path: direct allocation and transfer
-            layer_stored = self._store_layer_standard(layer_id, layer_chunks,
-                                                      memory_format, **kwargs)
+            raise NotImplementedError("Non-RDMA store is not implemented")
 
         layer_time = time.perf_counter() - layer_st
         logger.debug(
@@ -1191,52 +1189,58 @@ class LayerAwareLMCacheEngine(LMCacheEngine):
         """
         if not layer_chunks:
             return 0
-            
+
         # Step 1: Filter out already cached chunks and calculate total tokens
         valid_chunks = []
         total_tokens = 0
-        
+
         with NVTXContext("filter_and_calculate"):
             for start, end, layer_key in layer_chunks:
                 if not self.storage_manager.contains(layer_key):
                     valid_chunks.append((start, end, layer_key))
                     total_tokens += (end - start)
-        
+
         if not valid_chunks:
             return 0
-            
+
         logger.debug(
             f"RDMA store for layer {layer_id}: {len(valid_chunks)} chunks, "
-            f"{total_tokens} total tokens (reduced from {len(layer_chunks)} chunks)")
-        
+            f"{total_tokens} total tokens (reduced from {len(layer_chunks)} chunks)"
+        )
+
         # Step 2: Create combined key with embedded chunk mappings (Option 1)
         with NVTXContext("create_combined_key"):
             combined_layer_key = CombinedLayerCacheEngineKey.create_combined_key(
                 valid_chunks, layer_id)
-            
+
             # Calculate combined shape for all chunks in this layer
             combined_kv_shape = self.gpu_connector.get_shape(total_tokens)
             kv_dtype = self.metadata.kv_dtype
-            
+
             # Single dry_allocate call for the entire layer
             combined_metadata = self.storage_manager.dry_allocate(
                 combined_kv_shape, kv_dtype, fmt=memory_format)
-            
+
             if combined_metadata is None:
-                logger.warning(f"Failed to prepare metadata for layer {layer_id}")
+                logger.warning(
+                    f"Failed to prepare metadata for layer {layer_id}")
                 return 0
-            
+
             # Register the single large allocation
-            self.storage_manager.prepare_put([combined_layer_key], [combined_metadata])
-            
+            self.storage_manager.prepare_put([combined_layer_key],
+                                             [combined_metadata])
+
             # Single allocate call for the entire layer
             combined_memory_obj = self.storage_manager.allocate(
-                combined_metadata.shape, combined_metadata.dtype, fmt=combined_metadata.fmt)
-            
+                combined_metadata.shape,
+                combined_metadata.dtype,
+                fmt=combined_metadata.fmt)
+
             if combined_memory_obj is None:
-                logger.warning(f"Failed to allocate combined memory for layer {layer_id}")
+                logger.warning(
+                    f"Failed to allocate combined memory for layer {layer_id}")
                 return 0
-        
+
         # Step 3: Transfer data from GPU to the combined memory object
         with NVTXContext("gpu_to_memory_transfer"):
             # Create a list of chunk offsets for the GPU connector
@@ -1244,42 +1248,49 @@ class LayerAwareLMCacheEngine(LMCacheEngine):
             current_offset = 0
             for start, end, layer_key in valid_chunks:
                 num_chunk_tokens = end - start
-                chunk_offsets.append((start, end, layer_key, current_offset, current_offset + num_chunk_tokens))
+                chunk_offsets.append((start, end, layer_key, current_offset,
+                                      current_offset + num_chunk_tokens))
                 current_offset += num_chunk_tokens
 
             success = self._transfer_gpu_to_combined_memory(
                 combined_memory_obj, chunk_offsets, layer_id, **kwargs)
-            
+
             if not success:
-                logger.warning(f"Failed to transfer GPU data for layer {layer_id}")
+                logger.warning(
+                    f"Failed to transfer GPU data for layer {layer_id}")
                 combined_memory_obj.ref_count_down()
                 return 0
-        
+
         # Step 4: Store combined object (Option 1 - sender side)
         with NVTXContext("store_combined_object"):
             # Store the combined memory object - chunk mappings are embedded in the key!
             # The receiver will extract these mappings when it receives the combined key
-            self.storage_manager.batched_put([combined_layer_key], [combined_memory_obj])
-            
+            self.storage_manager.batched_put([combined_layer_key],
+                                             [combined_memory_obj])
+
             # Update lookup server for p2p discovery (if enabled)
             if self.lookup_server is not None:
                 self.lookup_server.insert(combined_layer_key)
-            
-            logger.debug(f"Stored combined object with {len(chunk_offsets)} chunks for layer {layer_id}")
-            logger.debug(f"Combined key contains {len(combined_layer_key.chunk_mappings)} embedded chunk mappings")
-        
+
+            logger.debug(
+                f"Stored combined object with {len(chunk_offsets)} chunks for layer {layer_id}"
+            )
+            logger.debug(
+                f"Combined key contains {len(combined_layer_key.chunk_mappings)} embedded chunk mappings"
+            )
+
         # Step 5: Flush RDMA operations
         with NVTXContext("flush_rdma"):
             self.storage_manager.commit_put()
-        
-        logger.debug(f"Successfully stored {len(valid_chunks)} chunks as single combined object for layer {layer_id}")
-        return len(valid_chunks)
-    
 
-    
+        logger.debug(
+            f"Successfully stored {len(valid_chunks)} chunks as single combined object for layer {layer_id}"
+        )
+        return len(valid_chunks)
+
     def _transfer_gpu_to_combined_memory(self, combined_memory_obj: MemoryObj,
-                                         chunk_offsets: List[tuple], layer_id: int,
-                                         **kwargs) -> bool:
+                                         chunk_offsets: List[tuple],
+                                         layer_id: int, **kwargs) -> bool:
         """
         Transfer GPU data to different offsets within the combined memory object.
         
@@ -1291,87 +1302,24 @@ class LayerAwareLMCacheEngine(LMCacheEngine):
             # For VLLMPagedMemLayerwiseGPUConnector (KV_T2D format):
             # combined_memory_obj.tensor shape: [total_tokens, 2, hidden_dim]
             # Each chunk writes to combined_memory_obj.tensor[offset_start:offset_end]
-            
-            if isinstance(self.gpu_connector, VLLMPagedMemLayerwiseGPUConnector):
+
+            if isinstance(self.gpu_connector,
+                          VLLMPagedMemLayerwiseGPUConnector):
                 # Use the new combined memory transfer method
                 self.gpu_connector.from_gpu_to_combined_memory(
                     combined_memory_obj, chunk_offsets, layer_id, **kwargs)
                 return True
             else:
                 # Fallback to individual transfers for other connector types
-                logger.warning(f"Combined memory transfer not implemented for {type(self.gpu_connector)}")
-                return False
-                
-        except Exception as e:
-            logger.error(f"Failed to transfer GPU data to combined memory: {e}")
-            return False
-    
-
-
-    def _store_layer_standard(self, layer_id: int, layer_chunks: List[tuple],
-                              memory_format: MemoryFormat, **kwargs) -> int:
-        """
-        Store a single layer using standard (non-RDMA) transfers.
-        """
-        # Collect valid chunks and allocate memory objects
-        memory_objs = []
-        successful_keys = []
-        starts = []
-        ends = []
-
-        # Process all chunks for this layer
-        for start, end, layer_key in layer_chunks:
-            if self.storage_manager.contains(layer_key):
-                continue
-
-            # Get chunk-specific KV cache shape
-            num_chunk_tokens = end - start
-            kv_shape = self.gpu_connector.get_shape(num_chunk_tokens)
-            kv_dtype = self.metadata.kv_dtype
-
-            # Allocate memory with correct format
-            memory_obj = self.storage_manager.allocate(kv_shape,
-                                                       kv_dtype,
-                                                       fmt=memory_format)
-
-            if memory_obj is None:
                 logger.warning(
-                    f"Failed to allocate memory for layer {layer_id}, "
-                    f"chunk {start}:{end}")
-                continue
+                    f"Combined memory transfer not implemented for {type(self.gpu_connector)}"
+                )
+                return False
 
-            # Collect for batch transfer
-            memory_objs.append(memory_obj)
-            successful_keys.append(layer_key)
-            starts.append(start)
-            ends.append(end)
-
-            # Update lookup server
-            if self.lookup_server is not None:
-                self.lookup_server.insert(layer_key)
-
-        # Batch transfer data from GPU to memory objects
-        if memory_objs:
-            logger.debug(
-                f"Batch transferring {len(memory_objs)} chunks from GPU for layer {layer_id}"
-            )
-
-            # Format memory_objs for batched_from_gpu: List[List[MemoryObj]]
-            # Since we're processing one layer, we need [memory_objs] (layer dimension)
-            memory_objs_batched = [memory_objs]
-
-            # Use batched GPU transfer
-            gpu_generator = self.gpu_connector.batched_from_gpu(
-                memory_objs_batched, starts, ends, **kwargs)
-
-            # Execute the generator (first call sets up, second call transfers this layer)
-            next(gpu_generator)  # Setup
-            next(gpu_generator)  # Transfer layer data
-
-            # Batch put all memory objects
-            self.storage_manager.batched_put(successful_keys, memory_objs)
-
-        return len(memory_objs)
+        except Exception as e:
+            logger.error(
+                f"Failed to transfer GPU data to combined memory: {e}")
+            return False
 
     @_lmcache_nvtx_annotate
     @torch.inference_mode()
@@ -1395,7 +1343,7 @@ class LayerAwareLMCacheEngine(LMCacheEngine):
             Boolean mask indicating which tokens were retrieved, or None if timeout
         """
         # Wait for layer to be ready with microsecond precision
-        num_chunks = kwargs.get('num_chunks', 1) # At least 1 chunk.
+        num_chunks = kwargs.get('num_chunks', 1)  # At least 1 chunk.
         if not self.storage_manager.storage_backend.wait_for_layer_busy(
                 layer_id, timeout_us, num_chunks):
             logger.debug(f"Layer {layer_id} not ready within {timeout_us}μs")
@@ -1428,8 +1376,7 @@ class LayerAwareLMCacheEngine(LMCacheEngine):
             ret_mask = self._retrieve_layer_rdma(layer_id, layer_chunks,
                                                  memory_format, **kwargs)
         else:
-            ret_mask = self._retrieve_layer_standard(layer_id, layer_chunks,
-                                                     memory_format, **kwargs)
+            raise NotImplementedError("Standard retrieval not implemented")
 
         ed = time.perf_counter()
         retrieved_tokens = torch.sum(
@@ -1461,82 +1408,6 @@ class LayerAwareLMCacheEngine(LMCacheEngine):
         return self.storage_manager.storage_backend.wait_for_layers_batch(
             early_layers, timeout_us)
 
-    def _retrieve_layer_standard(self, layer_id: int,
-                                 layer_chunks: List[tuple],
-                                 memory_format: MemoryFormat,
-                                 **kwargs) -> Optional[torch.Tensor]:
-        """
-        Retrieve a single layer using standard (non-RDMA) transfers.
-        
-        Args:
-            layer_id: The layer ID to retrieve
-            layer_chunks: List of (start, end, layer_key) tuples for this layer
-            memory_format: Memory format to use (KV_T2D or KV_2LTD)
-            **kwargs: Additional arguments for GPU connector
-            
-        Returns:
-            Boolean mask indicating which tokens were retrieved, or None if no data
-        """
-        memory_objs = []
-        successful_ranges = []
-        tokens_length = None
-
-        # Collect all memory objects for this layer
-        for start, end, layer_key in layer_chunks:
-            if tokens_length is None:
-                # Infer tokens length from the first chunk
-                tokens_length = max(end for _, end, _ in layer_chunks)
-
-            memory_obj = self.storage_manager.get(layer_key)
-            if memory_obj is not None:
-                memory_objs.append(memory_obj)
-                successful_ranges.append((start, end))
-
-        if not memory_objs:
-            logger.debug(f"No memory objects found for layer {layer_id}")
-            return None
-
-        # Create return mask
-        ret_mask = torch.zeros(tokens_length, dtype=torch.bool, device="cpu")
-
-        # Transfer data to GPU using single layer method if possible, otherwise use generator
-        if memory_objs:
-            logger.debug(
-                f"Transferring {len(memory_objs)} chunks to GPU for layer {layer_id}"
-            )
-
-            # Prepare arguments for single layer GPU transfer
-            starts = [start for start, end in successful_ranges]
-            ends = [end for start, end in successful_ranges]
-
-            # Use direct method if available, otherwise fall back to generator
-            if isinstance(self.gpu_connector,
-                          VLLMPagedMemLayerwiseGPUConnector):
-                self.gpu_connector.to_gpu_single_layer(memory_objs, starts,
-                                                       ends, layer_id,
-                                                       **kwargs)
-            else:
-                # Fallback to generator pattern for other connector types
-                gpu_generator = self.gpu_connector.batched_to_gpu(
-                    starts, ends, **kwargs)
-                next(gpu_generator)  # Setup and prepare metadata
-                gpu_generator.send(
-                    memory_objs)  # Send memory objects for this layer
-                try:
-                    next(gpu_generator)  # Complete the transfer
-                except StopIteration:
-                    pass  # Generator finished
-
-            # Mark tokens as retrieved
-            for start, end in successful_ranges:
-                ret_mask[start:end] = True
-
-            # Cleanup memory objects
-            for memory_obj in memory_objs:
-                memory_obj.ref_count_down()
-
-        return ret_mask
-
     @_lmcache_nvtx_annotate
     @torch.inference_mode()
     def _retrieve_layer_rdma(self, layer_id: int, layer_chunks: List[tuple],
@@ -1559,24 +1430,25 @@ class LayerAwareLMCacheEngine(LMCacheEngine):
             Boolean mask indicating which tokens were retrieved, or None if no data
         """
         # Classify chunks by storage type (combined vs individual)
-        combined_chunks = []
-        individual_chunks = []
-        
+        individual_chunks: list[tuple[int, int,
+                                      CombinedLayerCacheEngineKey]] = []
+
         for start, end, layer_key in layer_chunks:
             # Option 1: All chunks are processed as individual chunks
             # The storage backend automatically handles chunk mapping extraction
             # from combined objects when get_blocking() is called
             individual_chunks.append((start, end, layer_key))
-        
+
         # Prepare return mask
-        tokens_length = max(end for _, end, _ in layer_chunks) if layer_chunks else 0
+        tokens_length = max(
+            end for _, end, _ in layer_chunks) if layer_chunks else 0
         ret_mask = torch.zeros(tokens_length, dtype=torch.bool, device="cpu")
-        
+
         # Process all chunks (Option 1: storage backend handles combined object extraction)
         if individual_chunks:
             memory_objs = []
             successful_ranges = []
-            
+
             for start, end, layer_key in individual_chunks:
                 # The storage backend's get_blocking() will:
                 # 1. Check for direct individual memory objects, OR
@@ -1584,31 +1456,26 @@ class LayerAwareLMCacheEngine(LMCacheEngine):
                 memory_obj = self.storage_manager.get(layer_key)
                 memory_objs.append(memory_obj)
                 successful_ranges.append((start, end))
-            
+
             if memory_objs:
                 starts = [start for start, end in successful_ranges]
                 ends = [end for start, end in successful_ranges]
-                
-                if isinstance(self.gpu_connector, VLLMPagedMemLayerwiseGPUConnector):
-                    self.gpu_connector.to_gpu_single_layer(memory_objs, starts, ends, layer_id, **kwargs)
+
+                if isinstance(self.gpu_connector,
+                              VLLMPagedMemLayerwiseGPUConnector):
+                    self.gpu_connector.to_gpu_single_layer(
+                        memory_objs, starts, ends, layer_id, **kwargs)
                 else:
-                    # Fallback to generator pattern for other connector types
-                    gpu_generator = self.gpu_connector.batched_to_gpu(starts, ends, **kwargs)
-                    next(gpu_generator)  # Setup and prepare metadata
-                    gpu_generator.send(memory_objs)  # Send memory objects for this layer
-                    try:
-                        next(gpu_generator)  # Complete the transfer
-                    except StopIteration:
-                        pass  # Generator finished
-                
+                    raise NotImplementedError("batched to gpu not implemented")
+
                 # Mark tokens as retrieved
                 for start, end in successful_ranges:
                     ret_mask[start:end] = True
-                
+
                 # Cleanup memory objects
                 for memory_obj in memory_objs:
                     memory_obj.ref_count_down()
-        
+
         return ret_mask if torch.sum(ret_mask) > 0 else None
 
 

@@ -715,7 +715,7 @@ class NixlReceiver:
                 )
             end = time.perf_counter()
             logger.debug("Observers processing in %.4f ms",
-                        1000 * (end - start))
+                         1000 * (end - start))
 
             # Acknowledge the remote side that the transfer was processed
             pipe.ack_receive()

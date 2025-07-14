@@ -12,7 +12,7 @@ import argparse
 import random
 import time
 import threading
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import numpy as np
 import torch
@@ -52,7 +52,7 @@ def generate_kv_cache_paged_list_tensors(num_blocks,
     for i in range(num_layers):
         # torch.manual_seed(42 + i)
         # kv = torch.rand(shape, dtype=dtype, device=device)
-        
+
         # Use deterministic initialization instead of random values
         # Each layer gets a unique base value for easier debugging/verification
         base_value = 0.1 + (i * 0.01)  # Layer 0: 0.1, Layer 1: 0.11, etc.
@@ -185,14 +185,17 @@ class LayerPerformanceTracker:
     """Track layer-specific performance metrics with detailed debugging."""
 
     def __init__(self, num_layers: int):
-        self.num_layers = num_layers
-        self.layer_times = {}
-        self.layer_ready_times = {}
-        self.layer_wait_times = {}  # Time spent waiting for each layer
-        self.layer_retrieve_times = {}  # Time spent retrieving each layer
-        self.layer_verify_times = {}  # Time spent verifying each layer
-        self.first_layer_latency = None
-        self.total_completion_time = None
+        self.num_layers: int = num_layers
+        self.layer_times: Dict[int, float] = {}
+        self.layer_ready_times: Dict[int, float] = {}
+        self.layer_wait_times: Dict[int, float] = {
+        }  # Time spent waiting for each layer
+        self.layer_retrieve_times: Dict[int, float] = {
+        }  # Time spent retrieving each layer
+        self.layer_verify_times: Dict[int, float] = {
+        }  # Time spent verifying each layer
+        self.first_layer_latency: Optional[float] = None
+        self.total_completion_time: Optional[float] = None
 
         # Detailed phase tracking
         self.phase_times = {
@@ -390,7 +393,9 @@ def run_receiver(args, config, metadata, tokens, retrieved_cache, slot_mapping,
         logger.debug(f"   🔄 Layer {target_layer}: Starting wait...")
 
         # Wait for this specific layer to be ready
-        if engine.storage_manager.storage_backend.wait_for_layer_busy(target_layer, timeout_us=10000000, num_chunks=args.num_chunks):  # 10s timeout per layer
+        if engine.storage_manager.storage_backend.wait_for_layer_busy(
+                target_layer, timeout_us=10000000,
+                num_chunks=args.num_chunks):  # 10s timeout per layer
             perf_tracker.record_layer_wait_end(target_layer, wait_start)
             layer_ready_time = time.time() - start_time
             perf_tracker.record_layer_ready(target_layer, layer_ready_time)

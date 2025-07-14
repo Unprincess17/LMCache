@@ -197,7 +197,6 @@ class LayerAwareNixlObserver(NixlObserverInterface):
         # Track layer readiness and statistics
         self._layer_ready_flags = [False] * num_layers
         self._layer_chunk_counts = [0] * num_layers
-        self._layer_expected_chunks = [None] * num_layers  # None = unknown, set dynamically
         self._layer_ready_timestamps = [0.0] * num_layers
 
         # Callbacks for layer readiness events
@@ -226,7 +225,7 @@ class LayerAwareNixlObserver(NixlObserverInterface):
         """
 
         # Track layers that become ready in this batch
-        newly_ready_layers = set() 
+        newly_ready_layers = set()
 
         # Process each received object
         for key, obj in zip(keys, objs):
@@ -234,8 +233,10 @@ class LayerAwareNixlObserver(NixlObserverInterface):
             if self.obj_pool is not None:
                 if is_view:
                     # Clone the tensor since it's a view that will be overwritten
+                    assert obj.tensor is not None, \
+                            "The tensor in the MemoryObj is None."
                     copied_obj = TensorMemoryObj(obj.tensor.clone(),
-                                                obj.metadata)
+                                                 obj.metadata)
                     self.obj_pool.add(key, copied_obj)
                 else:
                     self.obj_pool.add(key, obj)
@@ -246,7 +247,7 @@ class LayerAwareNixlObserver(NixlObserverInterface):
                 # This enables individual keys to find their combined objects
                 layer_id = key.layer_id
                 self._store_chunk_mappings_from_combined_key(key)
-                
+
                 # Mark layer as ready if expected
                 if layer_id < self.num_layers:
                     if not self._layer_ready_flags[layer_id]:
@@ -265,7 +266,6 @@ class LayerAwareNixlObserver(NixlObserverInterface):
                             self._mark_layer_ready(layer_id)
                             newly_ready_layers.add(layer_id)
 
-
         # Fire callbacks for newly ready layers
         for layer_id in newly_ready_layers:
             self._fire_callbacks_async(layer_id)
@@ -273,7 +273,8 @@ class LayerAwareNixlObserver(NixlObserverInterface):
         logger.debug(f"NixlObserver processed {len(keys)} objects, "
                      f"{len(newly_ready_layers)} layers became ready")
 
-    def _store_chunk_mappings_from_combined_key(self, combined_key: CombinedLayerCacheEngineKey):
+    def _store_chunk_mappings_from_combined_key(
+            self, combined_key: CombinedLayerCacheEngineKey):
         """
         Extract chunk mappings from a CombinedLayerCacheEngineKey and store them.
         
@@ -283,33 +284,46 @@ class LayerAwareNixlObserver(NixlObserverInterface):
         Args:
             combined_key: The CombinedLayerCacheEngineKey with embedded chunk mappings
         """
-        if not hasattr(combined_key, 'chunk_mappings') or not combined_key.chunk_mappings:
-            logger.warning(f"CombinedLayerCacheEngineKey has no chunk mappings: {combined_key}")
+        if not hasattr(combined_key,
+                       'chunk_mappings') or not combined_key.chunk_mappings:
+            logger.warning(
+                f"CombinedLayerCacheEngineKey has no chunk mappings: {combined_key}"
+            )
             return
-            
-        logger.debug(f"Extracting {len(combined_key.chunk_mappings)} chunk mappings from combined key")
-        
+
+        logger.debug(
+            f"Extracting {len(combined_key.chunk_mappings)} chunk mappings from combined key"
+        )
+
         # Extract each chunk mapping and store it in the storage backend
         for chunk_mapping in combined_key.chunk_mappings:
             try:
                 # Parse the individual chunk key from string
-                individual_key = LayerCacheEngineKey.from_string(chunk_mapping.chunk_key)
-                
+                individual_key = LayerCacheEngineKey.from_string(
+                    chunk_mapping.chunk_key)
+
                 # Store mapping: individual_key -> (combined_key, offset_start, offset_end)
                 if self.storage_backend is not None:
                     self.storage_backend.store_chunk_mapping(
-                        individual_key, combined_key, 
+                        individual_key, combined_key,
                         chunk_mapping.offset_start, chunk_mapping.offset_end)
                 else:
-                    logger.warning(f"Storage backend not available to store chunk mapping for {chunk_mapping.chunk_key}")
-                        
-            except Exception as e:
-                logger.error(f"Failed to store chunk mapping for {chunk_mapping.chunk_key}: {e}")
-                continue
-                
-        logger.debug(f"Layer {combined_key.layer_id} stored {len(combined_key.chunk_mappings)} chunk mappings")
+                    logger.warning(
+                        f"Storage backend not available to store chunk mapping for {chunk_mapping.chunk_key}"
+                    )
 
-    def _is_layer_complete(self, key: LayerCacheEngineKey, obj: MemoryObj, layer_id: int) -> bool:
+            except Exception as e:
+                logger.error(
+                    f"Failed to store chunk mapping for {chunk_mapping.chunk_key}: {e}"
+                )
+                continue
+
+        logger.debug(
+            f"Layer {combined_key.layer_id} stored {len(combined_key.chunk_mappings)} chunk mappings"
+        )
+
+    def _is_layer_complete(self, key: LayerCacheEngineKey, obj: MemoryObj,
+                           layer_id: int) -> bool:
         """
         Determine if a layer is complete based on received data.
         
@@ -326,15 +340,14 @@ class LayerAwareNixlObserver(NixlObserverInterface):
         """
         # Check if key contains chunk count information
         if hasattr(key, 'total_chunks'):
-            if self._layer_expected_chunks[layer_id] is None:
-                self._layer_expected_chunks[layer_id] = key.total_chunks
-                logger.debug(f"Layer {layer_id} expected chunks set to {key.total_chunks}")
-            
-            is_complete = self._layer_chunk_counts[layer_id] >= self._layer_expected_chunks[layer_id]
+            is_complete = self._layer_chunk_counts[
+                layer_id] >= key.total_chunks
             if is_complete:
-                logger.debug(f"Layer {layer_id} marked complete via key info ({self._layer_chunk_counts[layer_id]}/{self._layer_expected_chunks[layer_id]} chunks)")
+                logger.debug(
+                    f"Layer {layer_id} marked complete via key info ({self._layer_chunk_counts[layer_id]}/{key.total_chunks} chunks)"
+                )
             return is_complete
-            
+
         return False
 
     def _mark_layer_ready(self, layer_id: int) -> None:
@@ -372,18 +385,19 @@ class LayerAwareNixlObserver(NixlObserverInterface):
             self._mark_layer_ready(layer_id)
             self._fire_callbacks_async(layer_id)
 
-    def is_layer_ready(self, layer_id: int, num_chunks: Optional[int] = 1) -> bool:
+    def is_layer_ready(self, layer_id: int, num_chunks: int = 1) -> bool:
         """Check if layer is ready."""
         if layer_id >= self.num_layers:
             return False
-        return self._layer_chunk_counts[layer_id] >= num_chunks or self._layer_ready_flags[layer_id]
+        return self._layer_chunk_counts[
+            layer_id] >= num_chunks or self._layer_ready_flags[layer_id]
 
     @_lmcache_nvtx_annotate
     @torch.inference_mode()
     def wait_for_layer_busy(self,
                             layer_id: int,
                             timeout_us: int = 1000,
-                            num_chunks: Optional[int] = 1) -> bool:
+                            num_chunks: int = 1) -> bool:
         """
         Busy wait for layer readiness with microsecond precision.
         
@@ -419,7 +433,7 @@ class LayerAwareNixlObserver(NixlObserverInterface):
             List of layer IDs that became ready within timeout
         """
         start = time.perf_counter()
-        ready_layers = []
+        ready_layers: list[int] = []
 
         while len(ready_layers) < len(layer_ids):
             elapsed_us = (time.perf_counter() - start) * 1e6
@@ -536,14 +550,13 @@ class NixlBackend(StorageBackendInterface):
         super().__init__(dst_device=nixl_config.buffer_device)
         self._obj_pool = RecvObjPool(nixl_config.enable_gc)
         self._num_layers = num_layers
-
+        self._nixl_observer: NixlObserverInterface
         self._nixl_channel = NixlChannel(nixl_config)
 
         with NVTXContext("Create Nixl Observer"):
             if nixl_config.role == NixlRole.RECEIVER:
                 if num_layers is not None:
                     # Use LayerAwareNixlObserver for layer tracking
-                    # Pass storage backend reference for Option 1 chunk mapping storage
                     self._nixl_observer = LayerAwareNixlObserver(
                         num_layers, self._obj_pool, storage_backend=self)
                     logger.info(
@@ -556,19 +569,22 @@ class NixlBackend(StorageBackendInterface):
                         "Created BasicNixlObserver (num_layers not provided)")
 
                 self._nixl_channel.register_receive_observer(
-                observer=self._nixl_observer)
+                    observer=self._nixl_observer)
 
         self._registered_keys: list[CacheEngineKey] = []
         self._registered_metadatas: list[MemoryObjMetadata] = []
         self._num_payload_added = 0
-        
+
         # Add support for combined memory objects
         # Maps individual chunk keys to (combined_key, offset_start, offset_end)
-        self._chunk_to_combined_mapping: Dict[CacheEngineKey, Tuple[CacheEngineKey, int, int]] = {}
+        self._chunk_to_combined_mapping: Dict[CacheEngineKey,
+                                              Tuple[CacheEngineKey, int,
+                                                    int]] = {}
         self._combined_mapping_lock = threading.Lock()
-            
-    def store_chunk_mapping(self, chunk_key: CacheEngineKey, combined_key: CacheEngineKey,
-                           offset_start: int, offset_end: int) -> None:
+
+    def store_chunk_mapping(self, chunk_key: CacheEngineKey,
+                            combined_key: CacheEngineKey, offset_start: int,
+                            offset_end: int) -> None:
         """
         Store mapping from individual chunk key to combined memory object.
         
@@ -582,9 +598,13 @@ class NixlBackend(StorageBackendInterface):
             offset_end: End offset of chunk within combined object
         """
         with self._combined_mapping_lock:
-            self._chunk_to_combined_mapping[chunk_key] = (combined_key, offset_start, offset_end)
-    
-    def get_chunk_mapping(self, chunk_key: CacheEngineKey) -> Optional[Tuple[CacheEngineKey, int, int]]:
+            self._chunk_to_combined_mapping[chunk_key] = (combined_key,
+                                                          offset_start,
+                                                          offset_end)
+
+    def get_chunk_mapping(
+        self, chunk_key: CacheEngineKey
+    ) -> Optional[Tuple[CacheEngineKey, int, int]]:
         """
         Get mapping from individual chunk key to combined memory object.
         
@@ -596,7 +616,7 @@ class NixlBackend(StorageBackendInterface):
         """
         with self._combined_mapping_lock:
             return self._chunk_to_combined_mapping.get(chunk_key)
-            
+
     def remove_chunk_mapping(self, chunk_key: CacheEngineKey) -> None:
         """
         Remove mapping for individual chunk key.
@@ -627,7 +647,7 @@ class NixlBackend(StorageBackendInterface):
                 if pin:
                     self._obj_pool.pin(combined_key)
                 return True
-        
+
         # Check for the key directly (original logic)
         return self._obj_pool.contains(key)
 
@@ -749,25 +769,27 @@ class NixlBackend(StorageBackendInterface):
             # For Option 1: This could be a CombinedObjectReference or actual MemoryObj
             # The cache engine will handle CombinedObjectReference objects appropriately
             return direct_result
-        
+
         # Fallback to old approach: Check if this key maps to a combined memory object
         # This is for backward compatibility with engines not using Option 1
         chunk_mapping = self.get_chunk_mapping(key)
         if chunk_mapping is not None:
             combined_key, offset_start, offset_end = chunk_mapping
-            
+
             # Get the combined memory object
             combined_memory_obj = self._obj_pool.get(combined_key)
             if combined_memory_obj is not None:
                 # Extract the specific chunk from the combined memory object
                 return self._extract_chunk_from_combined_memory(
                     combined_memory_obj, offset_start, offset_end)
-        
+
         # Key not found
         return None
-    
-    def _extract_chunk_from_combined_memory(self, combined_memory_obj: MemoryObj, 
-                                           offset_start: int, offset_end: int) -> MemoryObj:
+
+    def _extract_chunk_from_combined_memory(self,
+                                            combined_memory_obj: MemoryObj,
+                                            offset_start: int,
+                                            offset_end: int) -> MemoryObj:
         """
         Extract a specific chunk from a combined memory object.
         
@@ -781,8 +803,10 @@ class NixlBackend(StorageBackendInterface):
         """
         # Extract the chunk tensor from the combined memory object
         # For KV_T2D format: [total_tokens, 2, hidden_dim] -> [chunk_tokens, 2, hidden_dim]
+        assert combined_memory_obj.tensor is not None
+
         chunk_tensor = combined_memory_obj.tensor[offset_start:offset_end]
-        
+
         # Create metadata for the extracted chunk
         chunk_metadata = MemoryObjMetadata(
             shape=chunk_tensor.shape,
@@ -791,17 +815,16 @@ class NixlBackend(StorageBackendInterface):
             phy_size=chunk_tensor.numel() * chunk_tensor.element_size(),
             ref_count=1,  # Start with ref count 1
             is_pin=False,
-            fmt=combined_memory_obj.get_memory_format()
-        )
-        
+            fmt=combined_memory_obj.get_memory_format())
+
         # Create a new TensorMemoryObj for the extracted chunk
         # Note: This creates a view of the original tensor, not a copy
         chunk_memory_obj = TensorMemoryObj(
             raw_data=chunk_tensor,
             metadata=chunk_metadata,
-            parent_allocator=combined_memory_obj.parent_allocator if hasattr(combined_memory_obj, 'parent_allocator') else None
-        )
-        
+            parent_allocator=combined_memory_obj.parent_allocator if hasattr(
+                combined_memory_obj, 'parent_allocator') else None)
+
         return chunk_memory_obj
 
     def get_non_blocking(
@@ -819,14 +842,14 @@ class NixlBackend(StorageBackendInterface):
         chunk_mapping = self.get_chunk_mapping(key)
         if chunk_mapping is not None:
             combined_key, offset_start, offset_end = chunk_mapping
-            
+
             # Check if the combined memory object exists
             if not self._obj_pool.contains(combined_key):
                 return None
-            
+
             # Create a Future object for the combined memory retrieval
-            future = Future()
-            
+            future: Future[Optional[MemoryObj]] = Future()
+
             def get_and_extract_chunk():
                 try:
                     # Get the combined memory object
@@ -840,13 +863,13 @@ class NixlBackend(StorageBackendInterface):
                         future.set_result(None)
                 except Exception as e:
                     future.set_exception(e)
-            
+
             # Start a new thread to perform the get and extract operation
             thread = threading.Thread(target=get_and_extract_chunk)
             thread.start()
-            
+
             return future
-        
+
         # Check for the key directly (original logic)
         if not self.contains(key):
             return None

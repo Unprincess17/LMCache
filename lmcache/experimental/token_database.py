@@ -351,7 +351,7 @@ class LayerFirstTokenDataBase(ChunkedTokenDatabase):
         """
         if isinstance(tokens, list):
             tokens = torch.tensor(tokens)
-        
+
         # Batch CPU transfer - do this once at the beginning
         if isinstance(tokens, torch.Tensor) and tokens.is_cuda:
             tokens = tokens.cpu()
@@ -403,7 +403,7 @@ class LayerFirstTokenDataBase(ChunkedTokenDatabase):
         """
         if isinstance(tokens, list):
             tokens = torch.tensor(tokens)
-        
+
         # Batch CPU transfer - do this once at the beginning
         if isinstance(tokens, torch.Tensor) and tokens.is_cuda:
             tokens = tokens.cpu()
@@ -418,7 +418,10 @@ class LayerFirstTokenDataBase(ChunkedTokenDatabase):
             token_chunks = self._chunk_tokens(tokens)
 
         # Maintain layer-specific prefix hash state to match process_tokens_for_layer behavior
-        layer_prefix_hashes = {layer_id: self._get_init_hash() for layer_id in range(self.num_layers)}
+        layer_prefix_hashes = {
+            layer_id: self._get_init_hash()
+            for layer_id in range(self.num_layers)
+        }
 
         start_idx = 0
         # Iterate over chunks, computing layer-specific hashes on-the-fly
@@ -430,15 +433,21 @@ class LayerFirstTokenDataBase(ChunkedTokenDatabase):
             if mask is not None and start_idx < num_falses:
                 # Still need to update prefix hashes even for masked chunks to maintain consistency
                 for layer_id in range(self.num_layers):
-                    layer_prefix_hashes[layer_id] = self._hash(token_chunk, layer_prefix_hashes[layer_id], layer_id=layer_id)
+                    layer_prefix_hashes[layer_id] = self._hash(
+                        token_chunk,
+                        layer_prefix_hashes[layer_id],
+                        layer_id=layer_id)
                 continue
 
             # For each layer, compute the current prefix hash and yield result
             for layer_id in range(self.num_layers):
                 # Update the prefix hash for this layer (same as process_tokens_for_layer)
-                layer_prefix_hashes[layer_id] = self._hash(token_chunk, layer_prefix_hashes[layer_id], layer_id=layer_id)
+                layer_prefix_hashes[layer_id] = self._hash(
+                    token_chunk,
+                    layer_prefix_hashes[layer_id],
+                    layer_id=layer_id)
                 current_prefix_hash = layer_prefix_hashes[layer_id]
-                
+
                 if make_key:
                     # Use the prefix_hash directly (same as process_tokens_for_layer)
                     yield start_idx, end_idx, self._make_key_by_hash(

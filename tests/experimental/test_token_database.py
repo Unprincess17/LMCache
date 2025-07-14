@@ -121,35 +121,35 @@ def test_layer_first_token_database(chunk_length, num_layers):
 
     test_length = 512
     tokens = generate_tokens(test_length, "cpu")
-    
+
     db = LayerFirstTokenDataBase(cfg, metadata)
-    
+
     # Process tokens
     results = list(db.process_tokens(tokens))
-    
+
     # Calculate expected number of results
     num_chunks = (test_length + chunk_length - 1) // chunk_length
     expected_results = num_chunks * num_layers
-    
+
     assert len(results) == expected_results
-    
+
     # Verify that results are organized by chunk first, then by layer
     result_idx = 0
     for chunk_id in range(num_chunks):
         chunk_start = chunk_id * chunk_length
         chunk_end = min(chunk_start + chunk_length, test_length)
-        
+
         for layer_id in range(num_layers):
             st, ed, key = results[result_idx]
-            
+
             # Check start and end indices
             assert st == chunk_start
             assert ed == chunk_end
-            
+
             # Check that key is LayerCacheEngineKey
             assert isinstance(key, LayerCacheEngineKey)
             assert key.layer_id == layer_id
-            
+
             result_idx += 1
 
 
@@ -160,25 +160,25 @@ def test_layer_first_token_database_with_mask(chunk_length):
                                           backend="cpu")
     metadata = dumb_metadata()
     metadata.num_layers = 4
-    
+
     test_length = 256
     tokens = generate_tokens(test_length, "cpu")
-    
+
     # Create mask that masks out first chunk
     mask = torch.full([test_length], True, dtype=torch.bool, device="cpu")
     mask[:chunk_length] = False
-    
+
     db = LayerFirstTokenDataBase(cfg, metadata)
-    
+
     # Process tokens with mask
     results = list(db.process_tokens(tokens, mask))
-    
+
     # Calculate expected number of results (excluding first chunk)
     num_chunks = (test_length + chunk_length - 1) // chunk_length
     expected_results = (num_chunks - 1) * metadata.num_layers
-    
+
     assert len(results) == expected_results
-    
+
     # Verify that first chunk is skipped
     for st, ed, key in results:
         assert st >= chunk_length  # All results should start after first chunk
@@ -189,28 +189,28 @@ def test_layer_first_token_database_hash_uniqueness():
     cfg = LMCacheEngineConfig.from_legacy(chunk_size=64, backend="cpu")
     metadata = dumb_metadata()
     metadata.num_layers = 3
-    
+
     test_length = 64  # Single chunk
     tokens = generate_tokens(test_length, "cpu")
-    
+
     db = LayerFirstTokenDataBase(cfg, metadata)
-    
+
     # Process tokens
     results = list(db.process_tokens(tokens))
-    
+
     assert len(results) == 3  # One result per layer
-    
+
     # Extract hashes from keys
     hashes = [key.chunk_hash for st, ed, key in results]
-    
+
     # Verify all hashes are different
     assert len(set(hashes)) == 3, "All layer hashes should be unique"
-    
+
     # Verify all results have same start/end but different layer_ids
     starts = [st for st, ed, key in results]
     ends = [ed for st, ed, key in results]
     layer_ids = [key.layer_id for st, ed, key in results]
-    
+
     assert all(st == 0 for st in starts)
     assert all(ed == 64 for ed in ends)
     assert layer_ids == [0, 1, 2]
@@ -221,22 +221,22 @@ def test_layer_first_token_database_make_key_false():
     cfg = LMCacheEngineConfig.from_legacy(chunk_size=32, backend="cpu")
     metadata = dumb_metadata()
     metadata.num_layers = 2
-    
+
     test_length = 32  # Single chunk
     tokens = generate_tokens(test_length, "cpu")
-    
+
     db = LayerFirstTokenDataBase(cfg, metadata)
-    
+
     # Process tokens with make_key=False
     results = list(db.process_tokens(tokens, make_key=False))
-    
+
     assert len(results) == 2  # One result per layer
-    
+
     # Verify that third element is hash string, not key object
     for st, ed, hash_str in results:
         assert isinstance(hash_str, str)
         assert len(hash_str) == 64  # SHA256 hex digest length
-    
+
     # Verify hashes are different for different layers
     hashes = [hash_str for st, ed, hash_str in results]
     assert len(set(hashes)) == 2, "Layer hashes should be unique"
@@ -247,17 +247,17 @@ def test_layer_first_token_database_list_input():
     cfg = LMCacheEngineConfig.from_legacy(chunk_size=16, backend="cpu")
     metadata = dumb_metadata()
     metadata.num_layers = 2
-    
+
     # Use list instead of tensor
     tokens = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
-    
+
     db = LayerFirstTokenDataBase(cfg, metadata)
-    
+
     # Process tokens
     results = list(db.process_tokens(tokens))
-    
+
     assert len(results) == 2  # One result per layer
-    
+
     # Verify results
     for st, ed, key in results:
         assert st == 0
