@@ -378,25 +378,9 @@ def run_receiver(args, config, metadata, tokens, retrieved_cache, slot_mapping,
 
     logger.info("⏳ RECEIVER: Waiting for early layers...")
 
-    # Strategy 1: Wait for first layer with timeout
-    start_time = time.time()
-    early_layers = engine.wait_for_early_layers(
-        num_layers=1, timeout_us=60000000)  # 60s timeout
-
-    if not early_layers:
-        logger.error("❌ RECEIVER: Timeout waiting for early layers")
-        engine.close()
-        return None
-
-    first_layer_time = time.time() - start_time
-    perf_tracker.record_layer_ready(early_layers[0], first_layer_time)
-
-    logger.info(
-        f"⚡ RECEIVER: First layer {early_layers[0]} ready in {first_layer_time*1000:.2f}ms! Starting early processing..."
-    )
-
-    # Strategy 2: Process layers progressively as they become ready
+    # Process layers progressively as they become ready
     processed_layers = []
+    start_time = time.time()
 
     for target_layer in range(metadata.kv_shape[0]):
         layer_start = time.time()
@@ -406,11 +390,16 @@ def run_receiver(args, config, metadata, tokens, retrieved_cache, slot_mapping,
         logger.debug(f"   🔄 Layer {target_layer}: Starting wait...")
 
         # Wait for this specific layer to be ready
-        if engine.storage_manager.storage_backend.wait_for_layer_busy(
-                target_layer, timeout_us=10000000):  # 10s timeout per layer
+        if engine.storage_manager.storage_backend.wait_for_layer_busy(target_layer, timeout_us=10000000, num_chunks=args.num_chunks):  # 10s timeout per layer
             perf_tracker.record_layer_wait_end(target_layer, wait_start)
             layer_ready_time = time.time() - start_time
             perf_tracker.record_layer_ready(target_layer, layer_ready_time)
+
+            # Special handling for first layer - log the early processing message
+            if target_layer == 0:
+                logger.info(
+                    f"⚡ RECEIVER: First layer {target_layer} ready in {layer_ready_time*1000:.2f}ms! Starting early processing..."
+                )
 
             logger.debug(
                 f"   ⚡ Layer {target_layer}: Ready after {(time.time() - layer_start)*1000:.2f}ms wait"
@@ -485,6 +474,12 @@ def run_receiver(args, config, metadata, tokens, retrieved_cache, slot_mapping,
             )
             break
 
+    # Check if we processed any layers at all
+    if not processed_layers:
+        logger.error("❌ RECEIVER: No layers were processed (timeout or error)")
+        engine.close()
+        return None
+
     total_time = time.time() - start_time
 
     # Performance analysis
@@ -551,9 +546,16 @@ def run_receiver(args, config, metadata, tokens, retrieved_cache, slot_mapping,
         retrieve_times = detailed_metrics["per_layer_retrieve_times"]
 
         if wait_times:
-            slowest_wait_layers = sorted(wait_times.items(),
-                                         key=lambda x: x[1],
-                                         reverse=True)[:5]
+            # slowest_wait_layers = sorted(wait_times.items(),
+            #                              key=lambda x: x[1],
+            #                              reverse=True)[:5]
+            # record all >1s
+            slowest_wait_layers = [
+                (layer_id, wait_time)
+                for layer_id, wait_time in wait_times.items()
+                if wait_time > 1000
+            ]
+            slowest_wait_layers.sort(key=lambda x: x[1], reverse=True)
             logger.info(f"\n⏱️  SLOWEST WAIT TIMES:")
             for layer_id, wait_time in slowest_wait_layers:
                 logger.info(f"   Layer {layer_id}: {wait_time:.2f}ms wait")
@@ -561,9 +563,15 @@ def run_receiver(args, config, metadata, tokens, retrieved_cache, slot_mapping,
             logger.info(f"   Total wait time: {total_wait_time:.2f}ms")
 
         if retrieve_times:
-            slowest_retrieve_layers = sorted(retrieve_times.items(),
-                                             key=lambda x: x[1],
-                                             reverse=True)[:5]
+            # slowest_retrieve_layers = sorted(retrieve_times.items(),
+            #                                  key=lambda x: x[1],
+            #                                  reverse=True)[:5]
+            slowest_retrieve_layers = [
+                (layer_id, retrieve_time)
+                for layer_id, retrieve_time in retrieve_times.items()
+                if retrieve_time > 1000
+            ]
+            slowest_retrieve_layers.sort(key=lambda x: x[1], reverse=True)
             logger.info(f"\n📥 SLOWEST RETRIEVE TIMES:")
             for layer_id, retrieve_time in slowest_retrieve_layers:
                 logger.info(
@@ -729,7 +737,7 @@ if __name__ == "__main__":
     metadata = create_metadata()
 
     # Setup test data
-    num_blocks = 10000
+    num_blocks = 20000
     block_size = 16
     dtype = torch.bfloat16
     device = "cuda"

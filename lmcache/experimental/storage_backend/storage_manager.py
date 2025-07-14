@@ -83,6 +83,11 @@ class StorageManager:
         self.worker_id = metadata.worker_id
 
         self.stream = torch.cuda.Stream()
+        
+        # Add support for combined memory objects
+        # Maps individual chunk keys to (combined_key, offset_start, offset_end)
+        self.chunk_to_combined_mapping: Dict[CacheEngineKey, Tuple[CacheEngineKey, int, int]] = {}
+        self.combined_mapping_lock = threading.Lock()
 
     def allocate(
         self,
@@ -164,27 +169,32 @@ class StorageManager:
     def get(self, key: CacheEngineKey) -> Optional[MemoryObj]:
         """
         Blocking function to get the memory object from the storages.
+        Now supports retrieving from combined memory objects.
         """
-        # Search in prefetch task
+        # First check if this key maps to a combined memory object
+        chunk_mapping = self.get_chunk_mapping(key)
+        if chunk_mapping is not None:
+            combined_key, offset_start, offset_end = chunk_mapping
+            
+            # Get the combined memory object
+            combined_memory_obj = self._get_combined_memory_obj(combined_key)
+            if combined_memory_obj is not None:
+                # Extract the specific chunk from the combined memory object
+                return self._extract_chunk_from_combined(combined_memory_obj, offset_start, offset_end)
+        
+        # Search in prefetch task (original logic)
         self.manager_lock.acquire()
         prefetch_task = self.prefetch_tasks.get(key, None)
         self.manager_lock.release()
 
         # Wait until prefetch task finishes
-        # Here, it is assumed all prefetch tasks load the memoryobj to
-        # hot cache (pinned cpu buffer)
         if prefetch_task is not None:
             logger.debug("Waiting for prefetching result. "
                          "Optimally, this should not happen.")
-            # Calling result() twice (already once in callback) will have
-            # no effect
-            # Tune the timeout for better performance
             prefetch_task.result(timeout=1)
 
-        # Search all backends for blocking get
+        # Search all backends for blocking get (original logic)
         for backend_name, backend in self.storage_backends.items():
-
-            # NOTE(Jiayi): bypass the allocator for now
             memory_obj = backend.get_blocking(key)
             if memory_obj is not None:
                 if backend_name != "LocalCPUBackend":
@@ -195,6 +205,66 @@ class StorageManager:
                 return memory_obj
 
         return None
+        
+    def _get_combined_memory_obj(self, combined_key: CacheEngineKey) -> Optional[MemoryObj]:
+        """
+        Get the combined memory object from storage backends.
+        
+        Args:
+            combined_key: Key for the combined memory object
+            
+        Returns:
+            Combined memory object if found, None otherwise
+        """
+        # Search all backends for the combined memory object
+        for backend_name, backend in self.storage_backends.items():
+            memory_obj = backend.get_blocking(combined_key)
+            if memory_obj is not None:
+                if backend_name != "LocalCPUBackend":
+                    local_cpu_backend = self.storage_backends["LocalCPUBackend"]
+                    assert isinstance(local_cpu_backend, LocalCPUBackend)
+                    local_cpu_backend.write_back(combined_key, memory_obj)
+                return memory_obj
+        return None
+        
+    def _extract_chunk_from_combined(self, combined_memory_obj: MemoryObj, 
+                                    offset_start: int, offset_end: int) -> MemoryObj:
+        """
+        Extract a specific chunk from a combined memory object.
+        
+        Args:
+            combined_memory_obj: The combined memory object
+            offset_start: Start offset of the chunk
+            offset_end: End offset of the chunk
+            
+        Returns:
+            New memory object containing only the requested chunk
+        """
+        assert combined_memory_obj.tensor is not None, "Combined memory object has no tensor"
+        assert combined_memory_obj.metadata.fmt == MemoryFormat.KV_T2D, \
+            f"Expected KV_T2D format, got {combined_memory_obj.metadata.fmt}"
+        
+        # Extract the chunk: combined_memory_obj.tensor[offset_start:offset_end]
+        chunk_tensor = combined_memory_obj.tensor[offset_start:offset_end].clone()
+        
+        # Create metadata for the chunk
+        chunk_metadata = MemoryObjMetadata(
+            shape=chunk_tensor.shape,
+            dtype=chunk_tensor.dtype,
+            address=-1,  # Not relevant for CPU tensors
+            phy_size=chunk_tensor.numel() * chunk_tensor.element_size(),
+            ref_count=1,
+            fmt=MemoryFormat.KV_T2D
+        )
+        
+        # Create new memory object for the chunk
+        from lmcache.experimental.memory_management import TensorMemoryObj
+        chunk_memory_obj = TensorMemoryObj(
+            raw_data=chunk_tensor,
+            metadata=chunk_metadata
+        )
+        
+        return chunk_memory_obj
 
     def get_non_blocking(self, key: CacheEngineKey) -> Optional[Future]:
         """
@@ -455,6 +525,27 @@ class DistributedStorageManager:
         # allocators. Instead, we are using the NixlBackend's allocator for
         # zero-copy allocatations
         #self.allocator = allocator
+        
+    def get_chunk_mapping(self, chunk_key: CacheEngineKey) -> Optional[Tuple[CacheEngineKey, int, int]]:
+        """
+        Get mapping from individual chunk key to combined memory object.
+        
+        Args:
+            chunk_key: Individual chunk key
+            
+        Returns:
+            Tuple of (combined_key, offset_start, offset_end) if mapping exists, None otherwise
+        """
+        return self.storage_backend.get_chunk_mapping(chunk_key)
+        
+    def remove_chunk_mapping(self, chunk_key: CacheEngineKey) -> None:
+        """
+        Remove mapping for individual chunk key.
+        
+        Args:
+            chunk_key: Individual chunk key to remove mapping for
+        """
+        self.storage_backend.remove_chunk_mapping(chunk_key)
 
     def allocate(
         self,
@@ -532,6 +623,11 @@ class DistributedStorageManager:
         self,
         key: CacheEngineKey,
     ) -> Optional[MemoryObj]:
+        """
+        Get memory object from the storage backend.
+        Now supports retrieving from combined memory objects.
+        """
+        # The NixlBackend already handles combined memory objects in its get_blocking method
         obj = self.storage_backend.get_blocking(key)
         return obj
 
@@ -583,7 +679,12 @@ class DistributedStorageManager:
         search_range: Optional[List[str]] = None,
         pin: bool = False,
     ) -> bool:
-        return self.storage_backend.contains(key)
+        """
+        Check whether the key exists in the storage backend.
+        Now supports checking for keys in combined memory objects.
+        """
+        # The NixlBackend already handles combined memory objects in its contains method
+        return self.storage_backend.contains(key, pin)
 
     def close(self):
         self.storage_backend.close()

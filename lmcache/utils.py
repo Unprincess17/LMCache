@@ -128,6 +128,7 @@ class CacheEngineKey:
 class LayerCacheEngineKey(CacheEngineKey):
     """ A key for the layer cache engine """
     layer_id: int
+    chunk_num: int = 1
 
     def __hash__(self):
         return hash((
@@ -137,19 +138,20 @@ class LayerCacheEngineKey(CacheEngineKey):
             self.worker_id,
             self.chunk_hash,
             self.layer_id,
+            self.chunk_num,
         ))
 
     def to_string(self):
         return f"{self.fmt}@{self.model_name}@{self.world_size}"\
-            f"@{self.worker_id}@{self.chunk_hash}@{self.layer_id}"
+            f"@{self.worker_id}@{self.chunk_hash}@{self.layer_id}@{self.chunk_num}"
 
     @staticmethod
     def from_string(s):
         parts = s.split("@")
-        if len(parts) != 6:
+        if len(parts) != 7:
             raise ValueError(f"Invalid key string: {s}")
         return LayerCacheEngineKey(parts[0], parts[1], int(parts[2]),
-                                   int(parts[3]), parts[4], int(parts[5]))
+                                   int(parts[3]), parts[4], int(parts[5]), int(parts[6]))
 
     def to_dict(self):
         return {
@@ -159,7 +161,8 @@ class LayerCacheEngineKey(CacheEngineKey):
             "world_size": self.world_size,
             "worker_id": self.worker_id,
             "chunk_hash": self.chunk_hash,
-            "layer_id": self.layer_id
+            "layer_id": self.layer_id,
+            "chunk_num": self.chunk_num
         }
 
     @staticmethod
@@ -169,7 +172,239 @@ class LayerCacheEngineKey(CacheEngineKey):
                                    world_size=d["world_size"],
                                    worker_id=d["worker_id"],
                                    chunk_hash=d["chunk_hash"],
-                                   layer_id=d["layer_id"])
+                                   layer_id=d["layer_id"],
+                                   chunk_num=d["chunk_num"])
+
+
+@dataclass(order=True)
+class ChunkMappingInfo:
+    """Information about how individual chunks map to combined objects."""
+    chunk_key: str  # String representation of the individual chunk key
+    offset_start: int  # Start offset within combined object
+    offset_end: int    # End offset within combined object
+    
+    def to_dict(self):
+        return {
+            "__type__": "ChunkMappingInfo",
+            "chunk_key": self.chunk_key,
+            "offset_start": self.offset_start,
+            "offset_end": self.offset_end
+        }
+    
+    @staticmethod
+    def from_dict(d):
+        return ChunkMappingInfo(
+            chunk_key=d["chunk_key"],
+            offset_start=d["offset_start"],
+            offset_end=d["offset_end"]
+        )
+
+
+@dataclass(order=True)
+class CombinedLayerCacheEngineKey(LayerCacheEngineKey):
+    """
+    A specialized key for combined layer objects with chunk mapping information.
+    
+    This key represents a combined memory object that contains multiple individual 
+    chunks from the same layer. It includes mapping information that allows 
+    retrieval of individual chunks from different offsets within the combined object.
+    
+    Used in disaggregated inference scenarios where multiple small chunks are 
+    combined into larger objects for efficient RDMA transfer.
+    """
+    chunk_mappings: List[ChunkMappingInfo] = None  # Mapping from individual chunks to offsets
+    total_tokens: int = 0  # Total number of tokens in the combined object
+    is_combined: bool = True  # Flag to identify this as a combined key
+    
+    def __post_init__(self):
+        if self.chunk_mappings is None:
+            self.chunk_mappings = []
+    
+    def __hash__(self):
+        # Include chunk mappings in hash for uniqueness
+        mapping_hash = hash(tuple(
+            (mapping.chunk_key, mapping.offset_start, mapping.offset_end)
+            for mapping in self.chunk_mappings
+        ))
+        return hash((
+            self.fmt,
+            self.model_name,
+            self.world_size,
+            self.worker_id,
+            self.chunk_hash,
+            self.layer_id,
+            self.chunk_num,
+            mapping_hash,
+            self.total_tokens,
+        ))
+
+    def to_string(self):
+        # Extended string format to include combined object info
+        base_str = super().to_string()
+        mapping_str = "|".join([
+            f"{m.chunk_key}:{m.offset_start}-{m.offset_end}"
+            for m in self.chunk_mappings
+        ])
+        return f"{base_str}@combined@{self.total_tokens}@[{mapping_str}]"
+
+    def add_chunk_mapping(self, chunk_key: str, offset_start: int, offset_end: int):
+        """Add a new chunk mapping to this combined key."""
+        mapping = ChunkMappingInfo(chunk_key, offset_start, offset_end)
+        self.chunk_mappings.append(mapping)
+    
+    def get_chunk_mapping(self, chunk_key: str) -> Optional[ChunkMappingInfo]:
+        """Get the mapping information for a specific chunk key."""
+        for mapping in self.chunk_mappings:
+            if mapping.chunk_key == chunk_key:
+                return mapping
+        return None
+    
+    def get_individual_chunk_keys(self) -> List[str]:
+        """Get all individual chunk keys contained in this combined object."""
+        return [mapping.chunk_key for mapping in self.chunk_mappings]
+
+    @staticmethod
+    def from_string(s):
+        # Parse the extended string format for combined keys
+        # Format: base@combined@total_tokens@[chunk_mappings]
+        if "@combined@" not in s:
+            raise ValueError(f"Invalid combined key string: {s}")
+        
+        parts = s.split("@combined@")
+        if len(parts) != 2:
+            raise ValueError(f"Invalid combined key string: {s}")
+        
+        # Parse base LayerCacheEngineKey part
+        base_str = parts[0]
+        base_parts = base_str.split("@")
+        if len(base_parts) != 7:
+            raise ValueError(f"Invalid base key in combined string: {s}")
+        
+        # Parse combined-specific parts
+        combined_parts = parts[1].split("@[")
+        if len(combined_parts) != 2:
+            raise ValueError(f"Invalid combined format: {s}")
+        
+        total_tokens = int(combined_parts[0])
+        mapping_str = combined_parts[1].rstrip("]")
+        
+        # Parse chunk mappings
+        chunk_mappings = []
+        if mapping_str:  # Only parse if not empty
+            for mapping_part in mapping_str.split("|"):
+                if mapping_part:  # Skip empty parts
+                    key_and_range = mapping_part.split(":")
+                    if len(key_and_range) == 2:
+                        chunk_key = key_and_range[0]
+                        range_part = key_and_range[1].split("-")
+                        if len(range_part) == 2:
+                            offset_start = int(range_part[0])
+                            offset_end = int(range_part[1])
+                            chunk_mappings.append(ChunkMappingInfo(chunk_key, offset_start, offset_end))
+        
+        return CombinedLayerCacheEngineKey(
+            fmt=base_parts[0],
+            model_name=base_parts[1],
+            world_size=int(base_parts[2]),
+            worker_id=int(base_parts[3]),
+            chunk_hash=base_parts[4],
+            layer_id=int(base_parts[5]),
+            chunk_num=int(base_parts[6]),
+            chunk_mappings=chunk_mappings,
+            total_tokens=total_tokens
+        )
+
+    def to_dict(self):
+        return {
+            "__type__": "CombinedLayerCacheEngineKey",
+            "fmt": self.fmt,
+            "model_name": self.model_name,
+            "world_size": self.world_size,
+            "worker_id": self.worker_id,
+            "chunk_hash": self.chunk_hash,
+            "layer_id": self.layer_id,
+            "chunk_num": self.chunk_num,
+            "chunk_mappings": [mapping.to_dict() for mapping in self.chunk_mappings],
+            "total_tokens": self.total_tokens,
+            "is_combined": self.is_combined
+        }
+
+    @staticmethod
+    def from_dict(d):
+        # msgpack's object_hook deserializes nested objects recursively.
+        # By the time this method is called, the items in d["chunk_mappings"]
+        # have already been converted from dicts to ChunkMappingInfo objects,
+        # so we can use them directly.
+        chunk_mappings = d.get("chunk_mappings", [])
+        
+        return CombinedLayerCacheEngineKey(
+            fmt=d["fmt"],
+            model_name=d["model_name"],
+            world_size=d["world_size"],
+            worker_id=d["worker_id"],
+            chunk_hash=d["chunk_hash"],
+            layer_id=d["layer_id"],
+            chunk_num=d["chunk_num"],
+            chunk_mappings=chunk_mappings,
+            total_tokens=d.get("total_tokens", 0),
+            is_combined=d.get("is_combined", True)
+        )
+
+    @classmethod
+    def create_combined_key(cls, 
+                           chunks_with_metadata: List[Tuple[int, int, LayerCacheEngineKey]], 
+                           layer_id: int) -> "CombinedLayerCacheEngineKey":
+        """
+        Factory method to create a combined key from multiple individual keys.
+        
+        Args:
+            chunks_with_metadata: List of (start, end, layer_key) tuples to combine
+            layer_id: The layer ID for this combined object
+            
+        Returns:
+            A new CombinedLayerCacheEngineKey with proper chunk mappings
+        """
+        if not chunks_with_metadata:
+            raise ValueError("Cannot create combined key from empty list")
+        
+        # Use the first key as the base for metadata
+        base_key = chunks_with_metadata[0][2]
+        
+        # Create a deterministic hash from all individual keys
+        import hashlib
+        chunk_hashes = [key.chunk_hash for _, _, key in chunks_with_metadata]
+        combined_hash = hashlib.sha256('|'.join(sorted(chunk_hashes)).encode()).hexdigest()
+
+        # Populate chunk mappings and calculate total tokens
+        chunk_mappings = []
+        total_tokens = 0
+        current_offset = 0
+        for start, end, layer_key in chunks_with_metadata:
+            num_chunk_tokens = end - start
+            mapping = ChunkMappingInfo(
+                chunk_key=layer_key.to_string(),
+                offset_start=current_offset,
+                offset_end=current_offset + num_chunk_tokens
+            )
+            chunk_mappings.append(mapping)
+            current_offset += num_chunk_tokens
+            total_tokens += num_chunk_tokens
+        
+        # Create the combined key
+        combined_key = cls(
+            fmt=base_key.fmt,
+            model_name=base_key.model_name,
+            world_size=base_key.world_size,
+            worker_id=base_key.worker_id,
+            chunk_hash=f"combined_{layer_id}_{combined_hash}",
+            layer_id=layer_id,
+            chunk_num=len(chunks_with_metadata),  # Number of chunks combined
+            chunk_mappings=chunk_mappings,
+            total_tokens=total_tokens,
+            is_combined=True
+        )
+        
+        return combined_key
 
 
 ##### NVTX annotation #####

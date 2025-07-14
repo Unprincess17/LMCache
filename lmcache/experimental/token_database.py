@@ -88,7 +88,8 @@ class ChunkedTokenDatabase(TokenDatabase):
     ) -> str:
         # TODO: change it to a more efficient hash function
         if isinstance(tokens, torch.Tensor):
-            tokens_bytes = tokens.cpu().to(torch.uint32).numpy().tobytes()
+            # Assume tokens are already on CPU - no .cpu() call needed
+            tokens_bytes = tokens.to(torch.uint32).numpy().tobytes()
         elif isinstance(tokens, list):
             tokens_bytes = array.array('I', tokens).tobytes()
         return hashlib.sha256(prefix_hash.encode("ascii") +
@@ -154,6 +155,9 @@ class ChunkedTokenDatabase(TokenDatabase):
             raise ValueError("The number of Falses in the mask is not a "
                              "multiple of the chunk size.")
         total_len = len(tokens)
+
+        if isinstance(tokens, torch.Tensor) and tokens.is_cuda:
+            tokens = tokens.cpu()
 
         token_chunks = self._chunk_tokens(tokens)
         prefix_hashes = self._prefix_hash(token_chunks)
@@ -347,6 +351,10 @@ class LayerFirstTokenDataBase(ChunkedTokenDatabase):
         """
         if isinstance(tokens, list):
             tokens = torch.tensor(tokens)
+        
+        # Batch CPU transfer - do this once at the beginning
+        if isinstance(tokens, torch.Tensor) and tokens.is_cuda:
+            tokens = tokens.cpu()
 
         # Calculate num_falses once outside the loop
         num_falses = 0
@@ -395,6 +403,10 @@ class LayerFirstTokenDataBase(ChunkedTokenDatabase):
         """
         if isinstance(tokens, list):
             tokens = torch.tensor(tokens)
+        
+        # Batch CPU transfer - do this once at the beginning
+        if isinstance(tokens, torch.Tensor) and tokens.is_cuda:
+            tokens = tokens.cpu()
 
         # Calculate num_falses once outside the loop
         num_falses = 0

@@ -31,7 +31,7 @@ from lmcache.experimental.memory_management import (MemoryAllocatorInterface,
 from lmcache.experimental.storage_backend.connector.nixl_utils import (
     NixlConfig, NixlRole)
 from lmcache.logging import init_logger
-from lmcache.utils import CacheEngineKey, LayerCacheEngineKey, _lmcache_nvtx_annotate
+from lmcache.utils import CacheEngineKey, LayerCacheEngineKey, CombinedLayerCacheEngineKey, ChunkMappingInfo, _lmcache_nvtx_annotate
 
 logger = init_logger(__name__)
 
@@ -155,6 +155,10 @@ class NixlRequest:
             return CacheEngineKey.from_dict(d)
         elif t == "LayerCacheEngineKey":
             return LayerCacheEngineKey.from_dict(d)
+        elif t == "CombinedLayerCacheEngineKey":
+            return CombinedLayerCacheEngineKey.from_dict(d)
+        elif t == "ChunkMappingInfo":
+            return ChunkMappingInfo.from_dict(d)
         elif t == "MemoryObjMetadata":
             return MemoryObjMetadata.from_dict(d)
         elif t == "NixlRequest":
@@ -430,6 +434,7 @@ class NixlPipe:
                 break
             time.sleep(0.001)
 
+    @_lmcache_nvtx_annotate
     def ack_receive(self):
         """Send an acknowledgment to the remote peer indicating that 
         the transfer was received AND processed successfully.
@@ -710,7 +715,7 @@ class NixlReceiver:
                 )
             end = time.perf_counter()
             logger.debug("Observers processing in %.4f ms",
-                         1000 * (end - start))
+                        1000 * (end - start))
 
             # Acknowledge the remote side that the transfer was processed
             pipe.ack_receive()
@@ -746,7 +751,6 @@ class NixlReceiver:
                     logger.info(
                         f"New sender connected with ID: {sender_id.decode()}")
                     continue
-
                 request = NixlRequest.deserialize(msg)
                 logger.debug("Received request with %d keys from sender %s",
                              len(request.keys), sender_id.decode())

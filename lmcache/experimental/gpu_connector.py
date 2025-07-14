@@ -885,3 +885,239 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
 
     def get_shape(self, num_tokens: int) -> torch.Size:
         return torch.Size([num_tokens, 2, self.hidden_dim_size])
+
+    @_lmcache_nvtx_annotate
+    def from_gpu_to_combined_memory(self, combined_memory_obj: MemoryObj,
+                                    chunk_offsets: List[tuple], layer_id: int,
+                                    **kwargs):
+        """
+        Transfer GPU data to different offsets within a single combined memory object.
+        
+        This method enables the single-allocation optimization by allowing multiple
+        chunks to be written to different offsets within one large memory object.
+        
+        Args:
+            combined_memory_obj: Large memory object to write all chunks to
+            chunk_offsets: List of (start, end, layer_key, offset_start, offset_end) tuples
+            layer_id: The layer ID to transfer data from
+            **kwargs: Additional arguments including 'kvcaches' and 'slot_mapping'
+            
+        Raises:
+            ValueError: If 'kvcaches' or 'slot_mapping' not provided in kwargs
+        """
+        if "kvcaches" not in kwargs:
+            raise ValueError("'kvcaches' should be provided in kwargs.")
+        if "slot_mapping" not in kwargs:
+            raise ValueError("'slot_mapping' should be provided in kwargs.")
+
+        kvcaches: List[torch.Tensor] = kwargs["kvcaches"]
+        slot_mapping: torch.Tensor = kwargs["slot_mapping"]
+
+        # Validate inputs
+        assert combined_memory_obj.tensor is not None, "Combined memory object tensor is None"
+        assert combined_memory_obj.metadata.fmt == MemoryFormat.KV_T2D, \
+            f"Expected KV_T2D format, got {combined_memory_obj.metadata.fmt}"
+        assert layer_id < len(kvcaches), f"layer_id {layer_id} exceeds available layers"
+
+        # Calculate total tokens and prepare slot mapping
+        total_tokens = sum(offset_end - offset_start for _, _, _, offset_start, offset_end in chunk_offsets)
+        
+        # Build combined slot mapping by concatenating individual chunk slot mappings
+        combined_slot_mapping_chunks = []
+        for start, end, layer_key, offset_start, offset_end in chunk_offsets:
+            combined_slot_mapping_chunks.append(slot_mapping[start:end])
+        
+        combined_slot_mapping = torch.cat(combined_slot_mapping_chunks, dim=0)
+        
+        # Allocate temporary GPU buffer for the entire layer
+        buffer_shape = self.get_shape(total_tokens)
+        tmp_gpu_buffer_obj = self.gpu_buffer_allocator.allocate(
+            buffer_shape, self.dtype, MemoryFormat.KV_T2D)
+        
+        if tmp_gpu_buffer_obj is None:
+            raise RuntimeError("Failed to allocate GPU buffer for combined memory transfer")
+        
+        assert tmp_gpu_buffer_obj.tensor is not None
+        
+        try:
+            # Transfer from GPU KV cache to temporary buffer
+            with torch.cuda.stream(self.store_stream):
+                # Use single_layer_kv_transfer to get all data for this layer
+                lmc_ops.single_layer_kv_transfer(
+                    tmp_gpu_buffer_obj.tensor,
+                    kvcaches[layer_id][0],  # K cache for this layer
+                    kvcaches[layer_id][1],  # V cache for this layer
+                    combined_slot_mapping,
+                    True,  # True = PagedBuffer to LMCache direction
+                )
+                
+                # Copy from temporary buffer to combined memory object at specific offsets
+                buffer_offset = 0
+                for start, end, layer_key, offset_start, offset_end in chunk_offsets:
+                    chunk_tokens = end - start
+                    
+                    # Copy this chunk from buffer to the correct offset in combined memory
+                    combined_memory_obj.tensor[offset_start:offset_end].copy_(
+                        tmp_gpu_buffer_obj.tensor[buffer_offset:buffer_offset + chunk_tokens],
+                        non_blocking=True)
+                    
+                    buffer_offset += chunk_tokens
+                
+                # Synchronize to ensure all transfers complete
+                self.store_stream.synchronize()
+                
+        finally:
+            # Always free the temporary buffer
+            tmp_gpu_buffer_obj.ref_count_down()
+        
+        logger.debug(f"Successfully transferred {len(chunk_offsets)} chunks to combined memory for layer {layer_id}")
+    
+    @_lmcache_nvtx_annotate
+    def to_gpu_single_chunk(self, chunk_tensor: torch.Tensor, start: int, end: int,
+                           layer_id: int, **kwargs):
+        """
+        Transfer a single chunk tensor directly to GPU KV cache.
+        
+        This method is used when retrieving individual chunks from combined objects.
+        
+        Args:
+            chunk_tensor: The tensor data for this individual chunk
+            start: Start index in the token sequence for this chunk
+            end: End index in the token sequence for this chunk  
+            layer_id: The layer ID to transfer data to
+            **kwargs: Additional arguments including 'kvcaches' and 'slot_mapping'
+        """
+        if "kvcaches" not in kwargs:
+            raise ValueError("'kvcaches' should be provided in kwargs.")
+        if "slot_mapping" not in kwargs:
+            raise ValueError("'slot_mapping' should be provided in kwargs.")
+
+        kvcaches: List[torch.Tensor] = kwargs["kvcaches"]
+        slot_mapping: torch.Tensor = kwargs["slot_mapping"]
+
+        # Validate inputs
+        assert chunk_tensor is not None, "Chunk tensor is None"
+        assert layer_id < len(kvcaches), f"layer_id {layer_id} exceeds available layers"
+        
+        # Get slot mapping for this specific chunk
+        chunk_slot_mapping = slot_mapping[start:end]
+        num_tokens = end - start
+        
+        # Validate tensor shape
+        expected_shape = self.get_shape(num_tokens)
+        assert chunk_tensor.shape == expected_shape, \
+            f"Chunk tensor shape {chunk_tensor.shape} doesn't match expected {expected_shape}"
+        
+        # Allocate temporary GPU buffer for this chunk
+        tmp_gpu_buffer_obj = self.gpu_buffer_allocator.allocate(
+            expected_shape, self.dtype, MemoryFormat.KV_T2D)
+        
+        if tmp_gpu_buffer_obj is None:
+            raise RuntimeError("Failed to allocate GPU buffer for single chunk transfer")
+        
+        assert tmp_gpu_buffer_obj.tensor is not None
+        
+        try:
+            # Transfer chunk to GPU
+            with torch.cuda.stream(self.load_stream):
+                # Copy chunk data to GPU buffer
+                tmp_gpu_buffer_obj.tensor.copy_(chunk_tensor, non_blocking=True)
+                
+                # Transfer from GPU buffer to target layer KV cache
+                lmc_ops.single_layer_kv_transfer(
+                    tmp_gpu_buffer_obj.tensor,
+                    kvcaches[layer_id][0],  # K cache for this layer
+                    kvcaches[layer_id][1],  # V cache for this layer
+                    chunk_slot_mapping,
+                    False,  # False = LMCache to PagedBuffer direction
+                )
+                
+                # Synchronize to ensure transfer completes
+                self.load_stream.synchronize()
+                
+        finally:
+            # Always free the temporary buffer
+            tmp_gpu_buffer_obj.ref_count_down()
+        
+        logger.debug(f"Transferred single chunk ({num_tokens} tokens) to GPU layer {layer_id}")
+    
+    @_lmcache_nvtx_annotate  
+    def to_gpu_from_combined_memory(self, combined_memory_obj: MemoryObj,
+                                    chunk_offsets: List[tuple], layer_id: int,
+                                    **kwargs):
+        """
+        Transfer data from a combined memory object to GPU KV cache.
+        
+        This is the retrieval counterpart to from_gpu_to_combined_memory.
+        
+        Args:
+            combined_memory_obj: Large memory object containing all chunks
+            chunk_offsets: List of (start, end, layer_key, offset_start, offset_end) tuples
+            layer_id: The layer ID to transfer data to
+            **kwargs: Additional arguments including 'kvcaches' and 'slot_mapping'
+        """
+        if "kvcaches" not in kwargs:
+            raise ValueError("'kvcaches' should be provided in kwargs.")
+        if "slot_mapping" not in kwargs:
+            raise ValueError("'slot_mapping' should be provided in kwargs.")
+
+        kvcaches: List[torch.Tensor] = kwargs["kvcaches"]
+        slot_mapping: torch.Tensor = kwargs["slot_mapping"]
+
+        # Validate inputs
+        assert combined_memory_obj.tensor is not None, "Combined memory object tensor is None"
+        assert combined_memory_obj.metadata.fmt == MemoryFormat.KV_T2D, \
+            f"Expected KV_T2D format, got {combined_memory_obj.metadata.fmt}"
+        assert layer_id < len(kvcaches), f"layer_id {layer_id} exceeds available layers"
+
+        # Calculate total tokens and prepare slot mapping
+        total_tokens = sum(offset_end - offset_start for _, _, _, offset_start, offset_end in chunk_offsets)
+        
+        # Build combined slot mapping
+        combined_slot_mapping_chunks = []
+        for start, end, layer_key, offset_start, offset_end in chunk_offsets:
+            combined_slot_mapping_chunks.append(slot_mapping[start:end])
+        
+        combined_slot_mapping = torch.cat(combined_slot_mapping_chunks, dim=0)
+        
+        # Allocate temporary GPU buffer
+        buffer_shape = self.get_shape(total_tokens)
+        tmp_gpu_buffer_obj = self.gpu_buffer_allocator.allocate(
+            buffer_shape, self.dtype, MemoryFormat.KV_T2D)
+        
+        if tmp_gpu_buffer_obj is None:
+            raise RuntimeError("Failed to allocate GPU buffer for combined memory retrieval")
+        
+        assert tmp_gpu_buffer_obj.tensor is not None
+        
+        try:
+            # Copy from combined memory object to temporary buffer
+            with torch.cuda.stream(self.load_stream):
+                buffer_offset = 0
+                for start, end, layer_key, offset_start, offset_end in chunk_offsets:
+                    chunk_tokens = end - start
+                    
+                    # Copy this chunk from combined memory to buffer
+                    tmp_gpu_buffer_obj.tensor[buffer_offset:buffer_offset + chunk_tokens].copy_(
+                        combined_memory_obj.tensor[offset_start:offset_end],
+                        non_blocking=True)
+                    
+                    buffer_offset += chunk_tokens
+                
+                # Transfer from temporary buffer to GPU KV cache
+                lmc_ops.single_layer_kv_transfer(
+                    tmp_gpu_buffer_obj.tensor,
+                    kvcaches[layer_id][0],  # K cache for this layer
+                    kvcaches[layer_id][1],  # V cache for this layer
+                    combined_slot_mapping,
+                    False,  # False = LMCache to PagedBuffer direction
+                )
+                
+                # Synchronize to ensure transfer completes
+                self.load_stream.synchronize()
+                
+        finally:
+            # Always free the temporary buffer
+            tmp_gpu_buffer_obj.ref_count_down()
+        
+        logger.debug(f"Successfully transferred {len(chunk_offsets)} chunks from combined memory to GPU for layer {layer_id}")

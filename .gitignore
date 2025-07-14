@@ -112,3 +112,8 @@ lmcache/experimental/tests
 /lmcache/_version.py
 
 tests/disagg/test_nixl_storage_backend.py~
+tests/disagg/layertest/*.nsys-rep
+tests/disagg/layertest/*.ncu-rep
+
+# Spec
+.specstory
