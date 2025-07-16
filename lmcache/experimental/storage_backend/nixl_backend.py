@@ -229,7 +229,8 @@ class LayerAwareNixlObserver(NixlObserverInterface):
 
         # Process each received object
         for key, obj in zip(keys, objs):
-            # Store in object pool if provided
+            # Store in object pool if provided and determine the object to use for chunk extraction
+            stored_obj = obj  # Default to original object
             if self.obj_pool is not None:
                 if is_view:
                     # Clone the tensor since it's a view that will be overwritten
@@ -238,15 +239,16 @@ class LayerAwareNixlObserver(NixlObserverInterface):
                     copied_obj = TensorMemoryObj(obj.tensor.clone(),
                                                  obj.metadata)
                     self.obj_pool.add(key, copied_obj)
+                    stored_obj = copied_obj  # Use the cloned object for chunk extraction
                 else:
                     self.obj_pool.add(key, obj)
+                    stored_obj = obj  # Use the original object
 
             # Extract layer information if this is a layer-aware key
             if isinstance(key, CombinedLayerCacheEngineKey):
-                # Option 1: Extract and store chunk mappings from combined key
-                # This enables individual keys to find their combined objects
+                # enables individual keys to find their combined objects
                 layer_id = key.layer_id
-                self._store_chunk_mappings_from_combined_key(key)
+                self._store_chunk_mappings_from_combined_key(key, stored_obj)
 
                 # Mark layer as ready if expected
                 if layer_id < self.num_layers:
@@ -273,44 +275,37 @@ class LayerAwareNixlObserver(NixlObserverInterface):
         logger.debug(f"NixlObserver processed {len(keys)} objects, "
                      f"{len(newly_ready_layers)} layers became ready")
 
+    @_lmcache_nvtx_annotate
     def _store_chunk_mappings_from_combined_key(
-            self, combined_key: CombinedLayerCacheEngineKey):
+            self, combined_key: CombinedLayerCacheEngineKey, combined_obj: MemoryObj):
         """
-        Extract chunk mappings from a CombinedLayerCacheEngineKey and store them.
+        Extract individual chunk keys and objects from a CombinedLayerCacheEngineKey 
+        and store them directly in the obj_pool.
         
         This is called when receiving a combined key to enable individual chunk keys
-        to find their combined objects. Critical for Option 1 disaggregated inference.
+        to find their objects directly. Critical for Option 1 disaggregated inference.
         
         Args:
             combined_key: The CombinedLayerCacheEngineKey with embedded chunk mappings
+            combined_obj: The combined memory object containing all chunks
         """
-        if not hasattr(combined_key,
-                       'chunk_mappings') or not combined_key.chunk_mappings:
-            logger.warning(
-                f"CombinedLayerCacheEngineKey has no chunk mappings: {combined_key}"
-            )
-            return
-
-        logger.debug(
-            f"Extracting {len(combined_key.chunk_mappings)} chunk mappings from combined key"
-        )
-
-        # Extract each chunk mapping and store it in the storage backend
+        assert hasattr(combined_key, 'chunk_mappings') and \
+                combined_key.chunk_mappings, \
+                "CombinedLayerCacheEngineKey has no chunk mappings"
+        assert self.obj_pool is not None
+        # Extract each chunk mapping and store individual chunks in obj_pool
         for chunk_mapping in combined_key.chunk_mappings:
             try:
                 # Parse the individual chunk key from string
                 individual_key = LayerCacheEngineKey.from_string(
                     chunk_mapping.chunk_key)
 
-                # Store mapping: individual_key -> (combined_key, offset_start, offset_end)
-                if self.storage_backend is not None:
-                    self.storage_backend.store_chunk_mapping(
-                        individual_key, combined_key,
-                        chunk_mapping.offset_start, chunk_mapping.offset_end)
-                else:
-                    logger.warning(
-                        f"Storage backend not available to store chunk mapping for {chunk_mapping.chunk_key}"
-                    )
+                # Extract the specific chunk from the combined memory object
+                chunk_obj = self._extract_chunk_from_combined_memory(
+                    combined_obj, chunk_mapping.offset_start, chunk_mapping.offset_end)
+
+                # Store individual key and chunk directly in obj_pool
+                self.obj_pool.add(individual_key, chunk_obj)
 
             except Exception as e:
                 logger.error(
@@ -318,9 +313,46 @@ class LayerAwareNixlObserver(NixlObserverInterface):
                 )
                 continue
 
-        logger.debug(
-            f"Layer {combined_key.layer_id} stored {len(combined_key.chunk_mappings)} chunk mappings"
-        )
+    def _extract_chunk_from_combined_memory(self,
+                                            combined_memory_obj: MemoryObj,
+                                            offset_start: int,
+                                            offset_end: int) -> MemoryObj:
+        """
+        Extract a specific chunk from a combined memory object.
+        
+        Args:
+            combined_memory_obj: The combined memory object
+            offset_start: Start offset for the chunk
+            offset_end: End offset for the chunk
+            
+        Returns:
+            TensorMemoryObj representing the extracted chunk
+        """
+        # Extract the chunk tensor from the combined memory object
+        # For KV_T2D format: [total_tokens, 2, hidden_dim] -> [chunk_tokens, 2, hidden_dim]
+        assert combined_memory_obj.tensor is not None
+
+        chunk_tensor = combined_memory_obj.tensor[offset_start:offset_end]
+
+        # Create metadata for the extracted chunk
+        chunk_metadata = MemoryObjMetadata(
+            shape=chunk_tensor.shape,
+            dtype=chunk_tensor.dtype,
+            address=chunk_tensor.data_ptr(),
+            phy_size=chunk_tensor.numel() * chunk_tensor.element_size(),
+            ref_count=1,  # Start with ref count 1
+            is_pin=False,
+            fmt=combined_memory_obj.get_memory_format())
+
+        # Create a new TensorMemoryObj for the extracted chunk
+        # Note: This creates a view of the original tensor, not a copy
+        chunk_memory_obj = TensorMemoryObj(
+            raw_data=chunk_tensor,
+            metadata=chunk_metadata,
+            parent_allocator=combined_memory_obj.parent_allocator if hasattr(
+                combined_memory_obj, 'parent_allocator') else None)
+
+        return chunk_memory_obj
 
     def _is_layer_complete(self, key: LayerCacheEngineKey, obj: MemoryObj,
                            layer_id: int) -> bool:
@@ -582,6 +614,7 @@ class NixlBackend(StorageBackendInterface):
                                                     int]] = {}
         self._combined_mapping_lock = threading.Lock()
 
+    @_lmcache_nvtx_annotate
     def store_chunk_mapping(self, chunk_key: CacheEngineKey,
                             combined_key: CacheEngineKey, offset_start: int,
                             offset_end: int) -> None:
@@ -602,6 +635,7 @@ class NixlBackend(StorageBackendInterface):
                                                           offset_start,
                                                           offset_end)
 
+    @_lmcache_nvtx_annotate
     def get_chunk_mapping(
         self, chunk_key: CacheEngineKey
     ) -> Optional[Tuple[CacheEngineKey, int, int]]:
