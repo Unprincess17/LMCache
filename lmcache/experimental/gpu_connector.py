@@ -671,24 +671,31 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
 
         offset = starts[0] if starts else 0
 
+
         try:
             # Copy memory objects to GPU buffer
             # Use load_stream for consistency with batched_to_gpu
             with torch.cuda.stream(self.load_stream):
-                for start, end, memory_obj in zip(starts,
-                                                  ends,
-                                                  memory_objs,
-                                                  strict=False):
-                    assert memory_obj.metadata.fmt == MemoryFormat.KV_T2D, \
-                        f"Expected KV_T2D format, got {memory_obj.metadata.fmt}"
-                    assert memory_obj.tensor is not None, \
-                        "Memory object tensor is None"
+                # for start, end, memory_obj in zip(starts,
+                #                                   ends,
+                #                                   memory_objs,
+                #                                   strict=False):
+                #     assert memory_obj.metadata.fmt == MemoryFormat.KV_T2D, \
+                #         f"Expected KV_T2D format, got {memory_obj.metadata.fmt}"
+                #     assert memory_obj.tensor is not None, \
+                #         "Memory object tensor is None"
 
-                    # Copy this chunk to the appropriate position in GPU buffer
-                    buffer_start = start - offset
-                    buffer_end = end - offset
-                    tmp_gpu_buffer_obj.tensor[buffer_start:buffer_end].copy_(
-                        memory_obj.tensor, non_blocking=True)
+                #     # Copy this chunk to the appropriate position in GPU buffer
+                #     buffer_start = start - offset
+                #     buffer_end = end - offset
+                #     tmp_gpu_buffer_obj.tensor[buffer_start:buffer_end].copy_(
+                #         memory_obj.tensor, non_blocking=True)
+
+                with NVTXContext(f"concat_layer_{layer_id}"):
+                    combined_obj_tensor = torch.cat([memory_obj.tensor for memory_obj in memory_objs], dim=0)
+
+                with NVTXContext(f"copy_layer_{layer_id}"):
+                    tmp_gpu_buffer_obj.tensor.copy_(combined_obj_tensor, non_blocking=True)
 
                 # Transfer from GPU buffer to target layer KV cache
                 lmc_ops.single_layer_kv_transfer(
@@ -955,18 +962,8 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
                     True,  # True = PagedBuffer to LMCache direction
                 )
 
-                # Copy from temporary buffer to combined memory object at specific offsets
-                buffer_offset = 0
-                for start, end, layer_key, offset_start, offset_end in chunk_offsets:
-                    chunk_tokens = end - start
-
-                    # Copy this chunk from buffer to the correct offset in combined memory
-                    combined_memory_obj.tensor[offset_start:offset_end].copy_(
-                        tmp_gpu_buffer_obj.tensor[buffer_offset:buffer_offset +
-                                                  chunk_tokens],
-                        non_blocking=True)
-
-                    buffer_offset += chunk_tokens
+                with NVTXContext(f"copy_layer_{layer_id}"):
+                    combined_memory_obj.tensor.copy_(tmp_gpu_buffer_obj.tensor, non_blocking=True)
 
                 # Synchronize to ensure all transfers complete
                 self.store_stream.synchronize()
