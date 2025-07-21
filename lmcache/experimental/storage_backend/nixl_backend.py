@@ -44,10 +44,10 @@ class RecvObjPool:
         self._data: dict[CacheEngineKey, MemoryObj] = {}
         self._cnt: dict[CacheEngineKey, int] = {}
 
-        # TODO: Remove the hard-code
-        # HACK: have a recycle threshold to avoid the memory leak
-        self._recent_added_keys: list[CacheEngineKey] = []
-        self._recent_add_threshold = 80  # Keep recent 90 keys
+        # OPTIMIZATION: Use deque for better performance in append/popleft operations  
+        from collections import deque
+        self._recent_added_keys: deque[CacheEngineKey] = deque(maxlen=80)  # Auto-limits size
+        self._recent_add_threshold = 80  # Keep recent 80 keys
         self._recycle_threshold = 160
 
         self._enable_gc = enable_gc
@@ -100,6 +100,7 @@ class RecvObjPool:
         st = time.perf_counter()
         freed_size = 0
         current_keys = set(self._data.keys())
+        # OPTIMIZATION: Convert deque to set for efficient difference operation
         recent_keys = set(self._recent_added_keys)
         keys_to_evict = current_keys - recent_keys
         for key in keys_to_evict:
@@ -113,10 +114,8 @@ class RecvObjPool:
     @_lmcache_nvtx_annotate
     def add(self, key: CacheEngineKey, obj: MemoryObj):
         with self.lock:
-            # TODO: Get rid of this
+            # OPTIMIZATION: deque.append is O(1) and auto-limits size
             self._recent_added_keys.append(key)
-            self._recent_added_keys = \
-                    self._recent_added_keys[-self._recent_add_threshold:]
 
             if key in self._data:
                 self._cnt[key] += 1
@@ -131,6 +130,41 @@ class RecvObjPool:
                 self._dbg_deep_add += 1
 
             # DEBUG
+            self.dbg_report()
+
+    @_lmcache_nvtx_annotate
+    def batched_add(self, keys: List[CacheEngineKey], objs: List[MemoryObj]):
+        """
+        Batched version of add() to reduce lock acquisition overhead and
+        optimize list management for better performance.
+        
+        Args:
+            keys: List of cache engine keys
+            objs: List of corresponding memory objects
+        """
+        if not keys:
+            return
+            
+        with self.lock:
+            # OPTIMIZATION: Batch extend is more efficient than individual appends
+            # deque handles size limiting automatically
+            self._recent_added_keys.extend(keys)
+
+            # OPTIMIZATION: Reduce dictionary lookup overhead with batch operations
+            data_dict = self._data
+            cnt_dict = self._cnt
+            
+            # Batch update data and count dictionaries
+            for key, obj in zip(keys, objs, strict=True):
+                if key in data_dict:
+                    cnt_dict[key] += 1
+                    self._dbg_shallow_add += 1
+                else:
+                    data_dict[key] = obj
+                    cnt_dict[key] = 1
+                    self._dbg_deep_add += 1
+
+            # Single debug report for the entire batch
             self.dbg_report()
 
     def remove(self, key: CacheEngineKey):
@@ -209,6 +243,10 @@ class LayerAwareNixlObserver(NixlObserverInterface):
         # Statistics
         self._total_layers_transferred = 0
         self._transfer_start_time = time.perf_counter()
+        
+        # OPTIMIZATION: Cache for parsed LayerCacheEngineKey objects to avoid repeated string parsing
+        self._key_cache: Dict[str, LayerCacheEngineKey] = {}
+        self._key_cache_lock = threading.RLock()
 
     @_lmcache_nvtx_annotate
     def __call__(self,
@@ -238,17 +276,19 @@ class LayerAwareNixlObserver(NixlObserverInterface):
                             "The tensor in the MemoryObj is None."
                     copied_obj = TensorMemoryObj(obj.tensor.clone(),
                                                  obj.metadata)
-                    self.obj_pool.add(key, copied_obj)
+                    if not isinstance(key, CombinedLayerCacheEngineKey):
+                        self.obj_pool.add(key, copied_obj)
                     stored_obj = copied_obj  # Use the cloned object for chunk extraction
                 else:
-                    self.obj_pool.add(key, obj)
+                    if not isinstance(key, CombinedLayerCacheEngineKey):
+                        self.obj_pool.add(key, obj)
                     stored_obj = obj  # Use the original object
 
             # Extract layer information if this is a layer-aware key
             if isinstance(key, CombinedLayerCacheEngineKey):
                 # enables individual keys to find their combined objects
                 layer_id = key.layer_id
-                self._store_chunk_mappings_from_combined_key(key, stored_obj)
+                self._store_individual_chunks_from_combined_key(key, stored_obj)
 
                 # Mark layer as ready if expected
                 if layer_id < self.num_layers:
@@ -275,8 +315,31 @@ class LayerAwareNixlObserver(NixlObserverInterface):
         logger.debug(f"NixlObserver processed {len(keys)} objects, "
                      f"{len(newly_ready_layers)} layers became ready")
 
+    def _get_cached_key(self, chunk_key_str: str) -> LayerCacheEngineKey:
+        """
+        Get a cached LayerCacheEngineKey or parse and cache it if not present.
+        This reduces repeated string parsing overhead for the same chunk keys.
+        
+        Args:
+            chunk_key_str: String representation of the chunk key
+            
+        Returns:
+            Parsed LayerCacheEngineKey object
+        """
+        with self._key_cache_lock:
+            if chunk_key_str not in self._key_cache:
+                self._key_cache[chunk_key_str] = LayerCacheEngineKey.from_string(chunk_key_str)
+                # Limit cache size to prevent memory growth
+                if len(self._key_cache) > 1000:  # Reasonable limit
+                    # Remove oldest 20% of entries (simple LRU approximation)
+                    items_to_remove = list(self._key_cache.keys())[:200]
+                    for key in items_to_remove:
+                        del self._key_cache[key]
+            
+            return self._key_cache[chunk_key_str]
+
     @_lmcache_nvtx_annotate
-    def _store_chunk_mappings_from_combined_key(
+    def _store_individual_chunks_from_combined_key(
             self, combined_key: CombinedLayerCacheEngineKey, combined_obj: MemoryObj):
         """
         Extract individual chunk keys and objects from a CombinedLayerCacheEngineKey 
@@ -293,66 +356,63 @@ class LayerAwareNixlObserver(NixlObserverInterface):
                 combined_key.chunk_mappings, \
                 "CombinedLayerCacheEngineKey has no chunk mappings"
         assert self.obj_pool is not None
-        # Extract each chunk mapping and store individual chunks in obj_pool
-        for chunk_mapping in combined_key.chunk_mappings:
+        
+        # Pre-calculate common properties once for performance optimization
+        with NVTXContext("Pre-calculate common properties"):
+            base_format = combined_obj.get_memory_format()
+            parent_allocator = getattr(combined_obj, 'parent_allocator', None)
+            combined_tensor = combined_obj.tensor
+        
+        with NVTXContext("Batch parse chunk keys"):
+            individual_keys = []
+            for chunk_mapping in combined_key.chunk_mappings:
+                individual_key = self._get_cached_key(chunk_mapping.chunk_key)
+                individual_keys.append(individual_key)
+        
+        with NVTXContext("Pre-allocate batch data"):
+            chunk_objects = []
+            chunk_keys_for_batch = []
+            
+        with NVTXContext("Pre-calculate slice positions"):
+            slice_positions = [(mapping.offset_start, mapping.offset_end) 
+                             for mapping in combined_key.chunk_mappings]
+            
+        # Extract each chunk mapping and prepare objects for batched storage
+        for i, (slice_pos, individual_key) in enumerate(zip(slice_positions, individual_keys)):
             try:
-                # Parse the individual chunk key from string
-                individual_key = LayerCacheEngineKey.from_string(
-                    chunk_mapping.chunk_key)
+                with NVTXContext(f"Process chunk {i}"):
+                    # Extract the specific chunk from the combined memory object
+                    with NVTXContext("Extract chunk"):
+                        chunk_tensor = combined_tensor[slice_pos[0]:slice_pos[1]]
 
-                # Extract the specific chunk from the combined memory object
-                chunk_obj = self._extract_chunk_from_combined_memory(
-                    combined_obj, chunk_mapping.offset_start, chunk_mapping.offset_end)
+                    with NVTXContext("Create metadata"):
+                        chunk_metadata = MemoryObjMetadata(
+                            shape=chunk_tensor.shape,
+                            dtype=chunk_tensor.dtype,
+                            address=chunk_tensor.data_ptr(),
+                            phy_size=chunk_tensor.numel() * chunk_tensor.element_size(),
+                            ref_count=1,  # Start with ref count 1
+                            is_pin=False,
+                            fmt=base_format)  # Use pre-calculated format
 
-                # Store individual key and chunk directly in obj_pool
-                self.obj_pool.add(individual_key, chunk_obj)
+                    with NVTXContext("Create TensorMemoryObj"):
+                        chunk_obj = TensorMemoryObj(
+                            raw_data=chunk_tensor,
+                            metadata=chunk_metadata,
+                            parent_allocator=parent_allocator)
+
+                    # Collect for batched storage instead of immediate obj_pool.add
+                    chunk_objects.append(chunk_obj)
+                    chunk_keys_for_batch.append(individual_key)
 
             except Exception as e:
                 logger.error(
-                    f"Failed to store chunk mapping for {chunk_mapping.chunk_key}: {e}"
+                    f"Failed to process chunk mapping for chunk {i}: {e}"
                 )
                 continue
-
-    def _extract_chunk_from_combined_memory(self,
-                                            combined_memory_obj: MemoryObj,
-                                            offset_start: int,
-                                            offset_end: int) -> MemoryObj:
-        """
-        Extract a specific chunk from a combined memory object.
         
-        Args:
-            combined_memory_obj: The combined memory object
-            offset_start: Start offset for the chunk
-            offset_end: End offset for the chunk
-            
-        Returns:
-            TensorMemoryObj representing the extracted chunk
-        """
-        # Extract the chunk tensor from the combined memory object
-        # For KV_T2D format: [total_tokens, 2, hidden_dim] -> [chunk_tokens, 2, hidden_dim]
-        assert combined_memory_obj.tensor is not None
-
-        chunk_tensor = combined_memory_obj.tensor[offset_start:offset_end]
-
-        # Create metadata for the extracted chunk
-        chunk_metadata = MemoryObjMetadata(
-            shape=chunk_tensor.shape,
-            dtype=chunk_tensor.dtype,
-            address=chunk_tensor.data_ptr(),
-            phy_size=chunk_tensor.numel() * chunk_tensor.element_size(),
-            ref_count=1,  # Start with ref count 1
-            is_pin=False,
-            fmt=combined_memory_obj.get_memory_format())
-
-        # Create a new TensorMemoryObj for the extracted chunk
-        # Note: This creates a view of the original tensor, not a copy
-        chunk_memory_obj = TensorMemoryObj(
-            raw_data=chunk_tensor,
-            metadata=chunk_metadata,
-            parent_allocator=combined_memory_obj.parent_allocator if hasattr(
-                combined_memory_obj, 'parent_allocator') else None)
-
-        return chunk_memory_obj
+        with NVTXContext("Batch add to obj_pool"):
+            self.obj_pool.batched_add(chunk_keys_for_batch, chunk_objects)
 
     def _is_layer_complete(self, key: LayerCacheEngineKey, obj: MemoryObj,
                            layer_id: int) -> bool:
