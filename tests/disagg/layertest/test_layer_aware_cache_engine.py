@@ -388,7 +388,7 @@ def run_receiver(args, config, metadata, tokens, retrieved_cache, slot_mapping,
     if args.retrieval_method == 'bulk':
         # Option 1: Use the new bulk retrieval method
         logger.info("🚀 RECEIVER: Using bulk progressive retrieval...")
-        
+
         # Track bulk retrieval time
         bulk_start = time.perf_counter()
         results = engine.retrieve_layers_progressive(
@@ -398,65 +398,76 @@ def run_receiver(args, config, metadata, tokens, retrieved_cache, slot_mapping,
             timeout_us=10000000,  # 10s timeout per layer
             kvcaches=retrieved_cache,
             slot_mapping=slot_mapping,
-            num_chunks=args.num_chunks
-        )
+            num_chunks=args.num_chunks)
         bulk_time = time.perf_counter() - bulk_start
-        
+
         # Process results from bulk retrieval
         for layer_id in sorted(results.keys()):
             layer_start = time.time()
             ret_mask = results.get(layer_id)
-            
+
             if ret_mask is not None:
                 layer_ready_time = time.time() - start_time
                 perf_tracker.record_layer_ready(layer_id, layer_ready_time)
-                
+
                 # Special handling for first layer
                 if layer_id == 0:
                     logger.info(
                         f"⚡ RECEIVER: First layer {layer_id} ready via bulk retrieval in {layer_ready_time*1000:.2f}ms!"
                     )
-                
+
                 retrieved_tokens = torch.sum(ret_mask).item()
-                
+
                 # Track verification time
                 verify_start = perf_tracker.record_layer_verify_start(layer_id)
-                
+
                 # Verify the layer data
-                if verify_layer_pattern(retrieved_cache, slot_mapping, layer_id, tolerance=0.01):
+                if verify_layer_pattern(retrieved_cache,
+                                        slot_mapping,
+                                        layer_id,
+                                        tolerance=0.01):
                     verification_results[layer_id] = "✅ PASS"
                 else:
                     verification_results[layer_id] = "❌ FAIL"
-                
+
                 perf_tracker.record_layer_verify_end(layer_id, verify_start)
-                
+
                 layer_process_time = time.time() - layer_start
-                perf_tracker.record_layer_processed(layer_id, layer_process_time)
+                perf_tracker.record_layer_processed(layer_id,
+                                                    layer_process_time)
                 processed_layers.append(layer_id)
-                
+
                 # For bulk retrieval, we approximate timing breakdown
                 # Since bulk method combines waiting and retrieval
-                verify_time = perf_tracker.layer_verify_times.get(layer_id, 0) * 1000
-                
+                verify_time = perf_tracker.layer_verify_times.get(layer_id,
+                                                                  0) * 1000
+
                 logger.info(
                     f"   ✨ Layer {layer_id}: {retrieved_tokens} tokens | "
                     f"Total: {layer_process_time*1000:.1f}ms | "
                     f"Verify: {verify_time:.1f}ms | "
                     f"{verification_results[layer_id]}")
             else:
-                logger.warning(f"   ⚠️ Layer {layer_id}: No data from bulk retrieval")
-        
-        logger.info(f"🔍 Bulk retrieval completed in {bulk_time*1000:.2f}ms for {len(results)} layers")
-        
+                logger.warning(
+                    f"   ⚠️ Layer {layer_id}: No data from bulk retrieval")
+
+        logger.info(
+            f"🔍 Bulk retrieval completed in {bulk_time*1000:.2f}ms for {len(results)} layers"
+        )
+
     else:  # individual retrieval
         # Option 2: Use individual retrieval with pre-computed layer data (current approach)
-        logger.info("🔧 RECEIVER: Using individual retrieval with pre-computed keys...")
+        logger.info(
+            "🔧 RECEIVER: Using individual retrieval with pre-computed keys...")
         # Pre-compute all layer keys upfront before any waiting (like sender side)
         logger.info("🔧 RECEIVER: Pre-computing layer keys for all layers...")
         pre_compute_start = time.perf_counter()
-        layers_data = engine._group_keys_by_layers_first(tokens, None)  # mask=None since we want all tokens
+        layers_data = engine._group_keys_by_layers_first(
+            tokens, None)  # mask=None since we want all tokens
         pre_compute_time = time.perf_counter() - pre_compute_start
-        logger.info(f"✅ RECEIVER: Pre-computed keys for {len(layers_data)} layers in {pre_compute_time*1000:.2f}ms")
+        logger.info(
+            f"✅ RECEIVER: Pre-computed keys for {len(layers_data)} layers in {pre_compute_time*1000:.2f}ms"
+        )
 
         for target_layer in range(metadata.kv_shape[0]):
             layer_start = time.time()
@@ -516,18 +527,18 @@ def run_receiver(args, config, metadata, tokens, retrieved_cache, slot_mapping,
                     else:
                         verification_results[target_layer] = "❌ FAIL"
 
-                    perf_tracker.record_layer_verify_end(target_layer,
-                                                         verify_start)
+                    perf_tracker.record_layer_verify_end(
+                        target_layer, verify_start)
 
                     layer_process_time = time.time() - layer_start
-                    perf_tracker.record_layer_processed(target_layer,
-                                                        layer_process_time)
+                    perf_tracker.record_layer_processed(
+                        target_layer, layer_process_time)
 
                     processed_layers.append(target_layer)
 
                     # Detailed per-layer timing
-                    wait_time = perf_tracker.layer_wait_times.get(target_layer,
-                                                                  0) * 1000
+                    wait_time = perf_tracker.layer_wait_times.get(
+                        target_layer, 0) * 1000
                     retrieve_time = perf_tracker.layer_retrieve_times.get(
                         target_layer, 0) * 1000
                     verify_time = perf_tracker.layer_verify_times.get(
@@ -541,7 +552,8 @@ def run_receiver(args, config, metadata, tokens, retrieved_cache, slot_mapping,
                         f"Verify: {verify_time:.1f}ms | "
                         f"{verification_results[target_layer]}")
                 else:
-                    perf_tracker.record_layer_wait_end(target_layer, wait_start)
+                    perf_tracker.record_layer_wait_end(target_layer,
+                                                       wait_start)
                     logger.warning(
                         f"   ⚠️ Layer {target_layer}: Failed to retrieve data")
                     break
@@ -579,8 +591,7 @@ def run_receiver(args, config, metadata, tokens, retrieved_cache, slot_mapping,
     if detailed_metrics["status"] != "no_data":
         phase_breakdown = detailed_metrics["phase_breakdown"]
         logger.info(f"\n🔍 DETAILED TIMING BREAKDOWN:")
-        logger.info(
-            f"   Pre-compute time: {pre_compute_time*1000:.2f}ms")
+        logger.info(f"   Pre-compute time: {pre_compute_time*1000:.2f}ms")
         logger.info(
             f"   Total wait time: {phase_breakdown['total_wait_time_ms']:.2f}ms"
         )
@@ -609,7 +620,8 @@ def run_receiver(args, config, metadata, tokens, retrieved_cache, slot_mapping,
                           total_time_ms) * 100
 
             logger.info(f"\n📈 TIME DISTRIBUTION:")
-            logger.info(f"   Pre-compute time: {pre_compute_pct:.1f}% of total")
+            logger.info(
+                f"   Pre-compute time: {pre_compute_pct:.1f}% of total")
             logger.info(f"   Wait time: {wait_pct:.1f}% of total")
             logger.info(f"   Retrieve time: {retrieve_pct:.1f}% of total")
             logger.info(f"   Verify time: {verify_pct:.1f}% of total")
@@ -627,12 +639,19 @@ def run_receiver(args, config, metadata, tokens, retrieved_cache, slot_mapping,
             )
 
         # Key computation efficiency analysis
-        estimated_per_layer_key_compute = pre_compute_time / len(layers_data) if layers_data else 0
-        total_saved_time = estimated_per_layer_key_compute * len(processed_layers) * 1000
+        estimated_per_layer_key_compute = pre_compute_time / len(
+            layers_data) if layers_data else 0
+        total_saved_time = estimated_per_layer_key_compute * len(
+            processed_layers) * 1000
         logger.info(f"\n🎯 KEY COMPUTATION EFFICIENCY:")
-        logger.info(f"   Estimated per-layer key computation time: {estimated_per_layer_key_compute*1000:.2f}ms")
-        logger.info(f"   Total time saved by pre-computing: {total_saved_time:.2f}ms")
-        logger.info(f"   Efficiency improvement: {total_saved_time / (total_time*1000) * 100:.1f}% of total time")
+        logger.info(
+            f"   Estimated per-layer key computation time: {estimated_per_layer_key_compute*1000:.2f}ms"
+        )
+        logger.info(
+            f"   Total time saved by pre-computing: {total_saved_time:.2f}ms")
+        logger.info(
+            f"   Efficiency improvement: {total_saved_time / (total_time*1000) * 100:.1f}% of total time"
+        )
 
         # Per-layer analysis - show slowest layers
         wait_times = detailed_metrics["per_layer_wait_times"]
@@ -811,11 +830,14 @@ if __name__ == "__main__":
     parser.add_argument('--debug',
                         action='store_true',
                         help='Enable detailed debugging output')
-    parser.add_argument('--retrieval-method',
-                        type=str,
-                        choices=['individual', 'bulk'],
-                        default='individual',
-                        help='Retrieval method for receiver: individual (with pre-computed keys) or bulk progressive')
+    parser.add_argument(
+        '--retrieval-method',
+        type=str,
+        choices=['individual', 'bulk'],
+        default='individual',
+        help=
+        'Retrieval method for receiver: individual (with pre-computed keys) or bulk progressive'
+    )
 
     args = parser.parse_args()
 

@@ -671,7 +671,6 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
 
         offset = starts[0] if starts else 0
 
-
         try:
             # Copy memory objects to GPU buffer
             # Use load_stream for consistency with batched_to_gpu
@@ -692,10 +691,13 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
                 #         memory_obj.tensor, non_blocking=True)
 
                 with NVTXContext(f"concat_layer_{layer_id}"):
-                    combined_obj_tensor = torch.cat([memory_obj.tensor for memory_obj in memory_objs], dim=0)
+                    combined_obj_tensor = torch.cat(
+                        [memory_obj.tensor for memory_obj in memory_objs],
+                        dim=0)
 
                 with NVTXContext(f"copy_layer_{layer_id}"):
-                    tmp_gpu_buffer_obj.tensor.copy_(combined_obj_tensor, non_blocking=True)
+                    tmp_gpu_buffer_obj.tensor.copy_(combined_obj_tensor,
+                                                    non_blocking=True)
 
                 # Transfer from GPU buffer to target layer KV cache
                 lmc_ops.single_layer_kv_transfer(
@@ -963,7 +965,8 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
                 )
 
                 with NVTXContext(f"copy_layer_{layer_id}"):
-                    combined_memory_obj.tensor.copy_(tmp_gpu_buffer_obj.tensor, non_blocking=True)
+                    combined_memory_obj.tensor.copy_(tmp_gpu_buffer_obj.tensor,
+                                                     non_blocking=True)
 
                 # Synchronize to ensure all transfers complete
                 self.store_stream.synchronize()

@@ -388,7 +388,8 @@ class LayerFirstTokenDataBase(ChunkedTokenDatabase):
                 with NVTXContext("per layer token key"):
                     # For each layer, compute the layer-specific hash from chunk hash
                     for layer_id in range(self.num_layers):
-                        layer_hash = self._layer_hash(base_chunk_hash, layer_id)
+                        layer_hash = self._layer_hash(base_chunk_hash,
+                                                      layer_id)
 
                         if make_key:
                             yield start_idx, end_idx, self._make_key_by_hash(

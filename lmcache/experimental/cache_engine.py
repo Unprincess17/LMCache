@@ -154,7 +154,8 @@ class LMCacheEngine:
                 num_tokens = end - start
                 kv_shape = self.gpu_connector.get_shape(num_tokens)
                 kv_dtype = self.metadata.kv_dtype
-                memobj_meta = self.storage_manager.dry_allocate(kv_shape, kv_dtype)
+                memobj_meta = self.storage_manager.dry_allocate(
+                    kv_shape, kv_dtype)
                 assert memobj_meta is not None
                 keys.append(key)
                 metadatas.append(memobj_meta)
@@ -933,9 +934,8 @@ class LayerAwareLMCacheEngine(LMCacheEngine):
         """
 
         layers_data = {}
-        
-        token_processor = self.token_database.process_tokens(
-            tokens, mask)
+
+        token_processor = self.token_database.process_tokens(tokens, mask)
 
         iteration_count = 0
         for start, end, layer_key in token_processor:
@@ -1289,7 +1289,8 @@ class LayerAwareLMCacheEngine(LMCacheEngine):
                                   tokens: torch.Tensor,
                                   mask: Optional[torch.Tensor] = None,
                                   timeout_us: int = 1000,
-                                  layers_data: Optional[Dict[int, List[tuple]]] = None,
+                                  layers_data: Optional[Dict[
+                                      int, List[tuple]]] = None,
                                   **kwargs) -> Optional[torch.Tensor]:
         """
         Retrieve layer data as soon as it becomes ready.
@@ -1329,13 +1330,15 @@ class LayerAwareLMCacheEngine(LMCacheEngine):
         # Get layer-specific chunks - use pre-computed if available, otherwise compute on-demand
         if layers_data is not None and layer_id in layers_data:
             layer_chunks = layers_data[layer_id]
-            logger.debug(f"Using pre-computed layer chunks for layer {layer_id}")
+            logger.debug(
+                f"Using pre-computed layer chunks for layer {layer_id}")
         else:
             # Fallback to on-demand computation for backward compatibility
             layer_chunks = self._get_layer_keys_for_single_layer(
                 layer_id, tokens, mask)
-            logger.debug(f"Computing layer chunks on-demand for layer {layer_id}")
-        
+            logger.debug(
+                f"Computing layer chunks on-demand for layer {layer_id}")
+
         if not layer_chunks:
             logger.debug(f"No data for layer {layer_id}")
             self.stats_monitor.on_retrieve_finished(monitor_req_id, 0)
@@ -1363,12 +1366,13 @@ class LayerAwareLMCacheEngine(LMCacheEngine):
 
     @_lmcache_nvtx_annotate
     @torch.inference_mode()
-    def retrieve_layers_progressive(self,
-                                    tokens: torch.Tensor,
-                                    mask: Optional[torch.Tensor] = None,
-                                    layer_ids: Optional[List[int]] = None,
-                                    timeout_us: int = 1000,
-                                    **kwargs) -> Dict[int, Optional[torch.Tensor]]:
+    def retrieve_layers_progressive(
+            self,
+            tokens: torch.Tensor,
+            mask: Optional[torch.Tensor] = None,
+            layer_ids: Optional[List[int]] = None,
+            timeout_us: int = 1000,
+            **kwargs) -> Dict[int, Optional[torch.Tensor]]:
         """
         Retrieve multiple layers progressively with pre-computed layer keys.
         
@@ -1387,15 +1391,15 @@ class LayerAwareLMCacheEngine(LMCacheEngine):
             Dict mapping layer_id -> retrieval mask (or None if timeout/no data)
         """
         st = time.perf_counter()
-        
+
         # Pre-compute all layer keys upfront, similar to sender side
         logger.debug("Pre-computing layer keys for all layers...")
         layers_data = self._group_keys_by_layers_first(tokens, mask)
-        
+
         if not layers_data:
             logger.warning("No layer data to retrieve")
             return {}
-        
+
         # Determine which layers to process
         if layer_ids is None:
             layer_ids = sorted(layers_data.keys())
@@ -1406,32 +1410,38 @@ class LayerAwareLMCacheEngine(LMCacheEngine):
                     raise ValueError(f"Invalid layer ID: {layer_id}")
                 if layer_id not in layers_data:
                     logger.warning(f"No data for layer {layer_id}")
-        
+
         logger.debug(f"Pre-computed keys for {len(layers_data)} layers, "
                      f"will retrieve {len(layer_ids)} layers")
-        
+
         # Retrieve layers progressively using pre-computed data
         results = {}
         for layer_id in layer_ids:
             if layer_id in layers_data:
                 # Use pre-computed layer data - no key computation needed
                 ret_mask = self.retrieve_layer_when_ready(
-                    layer_id, tokens, mask, timeout_us, 
-                    layers_data=layers_data, **kwargs)
+                    layer_id,
+                    tokens,
+                    mask,
+                    timeout_us,
+                    layers_data=layers_data,
+                    **kwargs)
                 results[layer_id] = ret_mask
             else:
                 logger.warning(f"No pre-computed data for layer {layer_id}")
                 results[layer_id] = None
-        
+
         ed = time.perf_counter()
-        successful_layers = sum(1 for mask in results.values() if mask is not None)
-        total_tokens = sum(torch.sum(mask).item() for mask in results.values() 
-                          if mask is not None)
-        
+        successful_layers = sum(1 for mask in results.values()
+                                if mask is not None)
+        total_tokens = sum(
+            torch.sum(mask).item() for mask in results.values()
+            if mask is not None)
+
         logger.info(
             f"Progressive layer retrieval completed: {successful_layers}/{len(layer_ids)} layers, "
             f"{total_tokens} total tokens in {(ed-st)*1000:.2f}ms")
-        
+
         return results
 
     def wait_for_early_layers(self,

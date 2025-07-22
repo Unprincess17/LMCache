@@ -211,7 +211,8 @@ class CombinedLayerCacheEngineKey(LayerCacheEngineKey):
     Used in disaggregated inference scenarios where multiple small chunks are 
     combined into larger objects for efficient RDMA transfer.
     """
-    chunk_mappings: List[ChunkMappingInfo] = None  # Mapping from individual chunks to offsets
+    chunk_mappings: List[
+        ChunkMappingInfo] = None  # Mapping from individual chunks to offsets
     total_tokens: int = 0  # Total number of tokens in the combined object
     is_combined: bool = True  # Flag to identify this as a combined key
 
