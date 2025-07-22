@@ -385,99 +385,173 @@ def run_receiver(args, config, metadata, tokens, retrieved_cache, slot_mapping,
     processed_layers = []
     start_time = time.time()
 
-    for target_layer in range(metadata.kv_shape[0]):
-        layer_start = time.time()
-
-        # Track waiting time
-        wait_start = perf_tracker.record_layer_wait_start(target_layer)
-        logger.debug(f"   🔄 Layer {target_layer}: Starting wait...")
-
-        # Wait for this specific layer to be ready
-        if engine.storage_manager.storage_backend.wait_for_layer_busy(
-                target_layer, timeout_us=10000000,
-                num_chunks=args.num_chunks):  # 10s timeout per layer
-            perf_tracker.record_layer_wait_end(target_layer, wait_start)
-            layer_ready_time = time.time() - start_time
-            perf_tracker.record_layer_ready(target_layer, layer_ready_time)
-
-            # Special handling for first layer - log the early processing message
-            if target_layer == 0:
+    if args.retrieval_method == 'bulk':
+        # Option 1: Use the new bulk retrieval method
+        logger.info("🚀 RECEIVER: Using bulk progressive retrieval...")
+        
+        # Track bulk retrieval time
+        bulk_start = time.perf_counter()
+        results = engine.retrieve_layers_progressive(
+            tokens=tokens,
+            mask=None,
+            layer_ids=list(range(metadata.kv_shape[0])),
+            timeout_us=10000000,  # 10s timeout per layer
+            kvcaches=retrieved_cache,
+            slot_mapping=slot_mapping,
+            num_chunks=args.num_chunks
+        )
+        bulk_time = time.perf_counter() - bulk_start
+        
+        # Process results from bulk retrieval
+        for layer_id in sorted(results.keys()):
+            layer_start = time.time()
+            ret_mask = results.get(layer_id)
+            
+            if ret_mask is not None:
+                layer_ready_time = time.time() - start_time
+                perf_tracker.record_layer_ready(layer_id, layer_ready_time)
+                
+                # Special handling for first layer
+                if layer_id == 0:
+                    logger.info(
+                        f"⚡ RECEIVER: First layer {layer_id} ready via bulk retrieval in {layer_ready_time*1000:.2f}ms!"
+                    )
+                
+                retrieved_tokens = torch.sum(ret_mask).item()
+                
+                # Track verification time
+                verify_start = perf_tracker.record_layer_verify_start(layer_id)
+                
+                # Verify the layer data
+                if verify_layer_pattern(retrieved_cache, slot_mapping, layer_id, tolerance=0.01):
+                    verification_results[layer_id] = "✅ PASS"
+                else:
+                    verification_results[layer_id] = "❌ FAIL"
+                
+                perf_tracker.record_layer_verify_end(layer_id, verify_start)
+                
+                layer_process_time = time.time() - layer_start
+                perf_tracker.record_layer_processed(layer_id, layer_process_time)
+                processed_layers.append(layer_id)
+                
+                # For bulk retrieval, we approximate timing breakdown
+                # Since bulk method combines waiting and retrieval
+                verify_time = perf_tracker.layer_verify_times.get(layer_id, 0) * 1000
+                
                 logger.info(
-                    f"⚡ RECEIVER: First layer {target_layer} ready in {layer_ready_time*1000:.2f}ms! Starting early processing..."
+                    f"   ✨ Layer {layer_id}: {retrieved_tokens} tokens | "
+                    f"Total: {layer_process_time*1000:.1f}ms | "
+                    f"Verify: {verify_time:.1f}ms | "
+                    f"{verification_results[layer_id]}")
+            else:
+                logger.warning(f"   ⚠️ Layer {layer_id}: No data from bulk retrieval")
+        
+        logger.info(f"🔍 Bulk retrieval completed in {bulk_time*1000:.2f}ms for {len(results)} layers")
+        
+    else:  # individual retrieval
+        # Option 2: Use individual retrieval with pre-computed layer data (current approach)
+        logger.info("🔧 RECEIVER: Using individual retrieval with pre-computed keys...")
+        # Pre-compute all layer keys upfront before any waiting (like sender side)
+        logger.info("🔧 RECEIVER: Pre-computing layer keys for all layers...")
+        pre_compute_start = time.perf_counter()
+        layers_data = engine._group_keys_by_layers_first(tokens, None)  # mask=None since we want all tokens
+        pre_compute_time = time.perf_counter() - pre_compute_start
+        logger.info(f"✅ RECEIVER: Pre-computed keys for {len(layers_data)} layers in {pre_compute_time*1000:.2f}ms")
+
+        for target_layer in range(metadata.kv_shape[0]):
+            layer_start = time.time()
+
+            # Track waiting time
+            wait_start = perf_tracker.record_layer_wait_start(target_layer)
+            logger.debug(f"   🔄 Layer {target_layer}: Starting wait...")
+
+            # Wait for this specific layer to be ready
+            if engine.storage_manager.storage_backend.wait_for_layer_busy(
+                    target_layer, timeout_us=10000000,
+                    num_chunks=args.num_chunks):  # 10s timeout per layer
+                perf_tracker.record_layer_wait_end(target_layer, wait_start)
+                layer_ready_time = time.time() - start_time
+                perf_tracker.record_layer_ready(target_layer, layer_ready_time)
+
+                # Special handling for first layer - log the early processing message
+                if target_layer == 0:
+                    logger.info(
+                        f"⚡ RECEIVER: First layer {target_layer} ready in {layer_ready_time*1000:.2f}ms! Starting early processing..."
+                    )
+
+                logger.debug(
+                    f"   ⚡ Layer {target_layer}: Ready after {(time.time() - layer_start)*1000:.2f}ms wait"
                 )
 
-            logger.debug(
-                f"   ⚡ Layer {target_layer}: Ready after {(time.time() - layer_start)*1000:.2f}ms wait"
-            )
-
-            # Track retrieval time
-            retrieve_start = perf_tracker.record_layer_retrieve_start(
-                target_layer)
-
-            # Retrieve layer data immediately
-            ret_mask = engine.retrieve_layer_when_ready(
-                layer_id=target_layer,
-                tokens=tokens,
-                timeout_us=500000,  # 500ms timeout since we know it's ready
-                kvcaches=retrieved_cache,
-                slot_mapping=slot_mapping,
-                num_chunks=args.num_chunks)
-
-            perf_tracker.record_layer_retrieve_end(target_layer,
-                                                   retrieve_start)
-
-            if ret_mask is not None:
-                retrieved_tokens = torch.sum(ret_mask).item()
-
-                # Track verification time
-                verify_start = perf_tracker.record_layer_verify_start(
+                # Track retrieval time
+                retrieve_start = perf_tracker.record_layer_retrieve_start(
                     target_layer)
 
-                # Verify the layer data
-                if verify_layer_pattern(retrieved_cache,
-                                        slot_mapping,
-                                        target_layer,
-                                        tolerance=0.01):
-                    verification_results[target_layer] = "✅ PASS"
+                # NEW: Use pre-computed layer data - no key computation needed during retrieval!
+                ret_mask = engine.retrieve_layer_when_ready(
+                    layer_id=target_layer,
+                    tokens=tokens,
+                    timeout_us=500000,  # 500ms timeout since we know it's ready
+                    layers_data=layers_data,  # Pass pre-computed layer data
+                    kvcaches=retrieved_cache,
+                    slot_mapping=slot_mapping,
+                    num_chunks=args.num_chunks)
+
+                perf_tracker.record_layer_retrieve_end(target_layer,
+                                                       retrieve_start)
+
+                if ret_mask is not None:
+                    retrieved_tokens = torch.sum(ret_mask).item()
+
+                    # Track verification time
+                    verify_start = perf_tracker.record_layer_verify_start(
+                        target_layer)
+
+                    # Verify the layer data
+                    if verify_layer_pattern(retrieved_cache,
+                                            slot_mapping,
+                                            target_layer,
+                                            tolerance=0.01):
+                        verification_results[target_layer] = "✅ PASS"
+                    else:
+                        verification_results[target_layer] = "❌ FAIL"
+
+                    perf_tracker.record_layer_verify_end(target_layer,
+                                                         verify_start)
+
+                    layer_process_time = time.time() - layer_start
+                    perf_tracker.record_layer_processed(target_layer,
+                                                        layer_process_time)
+
+                    processed_layers.append(target_layer)
+
+                    # Detailed per-layer timing
+                    wait_time = perf_tracker.layer_wait_times.get(target_layer,
+                                                                  0) * 1000
+                    retrieve_time = perf_tracker.layer_retrieve_times.get(
+                        target_layer, 0) * 1000
+                    verify_time = perf_tracker.layer_verify_times.get(
+                        target_layer, 0) * 1000
+
+                    logger.info(
+                        f"   ✨ Layer {target_layer}: {retrieved_tokens} tokens | "
+                        f"Total: {layer_process_time*1000:.1f}ms | "
+                        f"Wait: {wait_time:.1f}ms | "
+                        f"Retrieve: {retrieve_time:.1f}ms | "
+                        f"Verify: {verify_time:.1f}ms | "
+                        f"{verification_results[target_layer]}")
                 else:
-                    verification_results[target_layer] = "❌ FAIL"
-
-                perf_tracker.record_layer_verify_end(target_layer,
-                                                     verify_start)
-
-                layer_process_time = time.time() - layer_start
-                perf_tracker.record_layer_processed(target_layer,
-                                                    layer_process_time)
-
-                processed_layers.append(target_layer)
-
-                # Detailed per-layer timing
-                wait_time = perf_tracker.layer_wait_times.get(target_layer,
-                                                              0) * 1000
-                retrieve_time = perf_tracker.layer_retrieve_times.get(
-                    target_layer, 0) * 1000
-                verify_time = perf_tracker.layer_verify_times.get(
-                    target_layer, 0) * 1000
-
-                logger.info(
-                    f"   ✨ Layer {target_layer}: {retrieved_tokens} tokens | "
-                    f"Total: {layer_process_time*1000:.1f}ms | "
-                    f"Wait: {wait_time:.1f}ms | "
-                    f"Retrieve: {retrieve_time:.1f}ms | "
-                    f"Verify: {verify_time:.1f}ms | "
-                    f"{verification_results[target_layer]}")
+                    perf_tracker.record_layer_wait_end(target_layer, wait_start)
+                    logger.warning(
+                        f"   ⚠️ Layer {target_layer}: Failed to retrieve data")
+                    break
             else:
                 perf_tracker.record_layer_wait_end(target_layer, wait_start)
+                wait_time = (time.time() - layer_start) * 1000
                 logger.warning(
-                    f"   ⚠️ Layer {target_layer}: Failed to retrieve data")
+                    f"   ⏰ Layer {target_layer}: Timeout after {wait_time:.1f}ms wait"
+                )
                 break
-        else:
-            perf_tracker.record_layer_wait_end(target_layer, wait_start)
-            wait_time = (time.time() - layer_start) * 1000
-            logger.warning(
-                f"   ⏰ Layer {target_layer}: Timeout after {wait_time:.1f}ms wait"
-            )
-            break
 
     # Check if we processed any layers at all
     if not processed_layers:
@@ -492,6 +566,7 @@ def run_receiver(args, config, metadata, tokens, retrieved_cache, slot_mapping,
     metrics = perf_tracker.get_metrics()  # For backward compatibility
 
     logger.info(f"\n📊 RECEIVER: Performance Analysis")
+    logger.info(f"   Pre-compute time: {pre_compute_time*1000:.2f}ms")
     logger.info(
         f"   Processed layers: {len(processed_layers)}/{metadata.kv_shape[0]}")
     logger.info(
@@ -504,6 +579,8 @@ def run_receiver(args, config, metadata, tokens, retrieved_cache, slot_mapping,
     if detailed_metrics["status"] != "no_data":
         phase_breakdown = detailed_metrics["phase_breakdown"]
         logger.info(f"\n🔍 DETAILED TIMING BREAKDOWN:")
+        logger.info(
+            f"   Pre-compute time: {pre_compute_time*1000:.2f}ms")
         logger.info(
             f"   Total wait time: {phase_breakdown['total_wait_time_ms']:.2f}ms"
         )
@@ -523,6 +600,7 @@ def run_receiver(args, config, metadata, tokens, retrieved_cache, slot_mapping,
         # Phase percentages
         total_time_ms = total_time * 1000
         if total_time_ms > 0:
+            pre_compute_pct = (pre_compute_time * 1000 / total_time_ms) * 100
             wait_pct = (phase_breakdown['total_wait_time_ms'] /
                         total_time_ms) * 100
             retrieve_pct = (phase_breakdown['total_retrieve_time_ms'] /
@@ -531,13 +609,15 @@ def run_receiver(args, config, metadata, tokens, retrieved_cache, slot_mapping,
                           total_time_ms) * 100
 
             logger.info(f"\n📈 TIME DISTRIBUTION:")
+            logger.info(f"   Pre-compute time: {pre_compute_pct:.1f}% of total")
             logger.info(f"   Wait time: {wait_pct:.1f}% of total")
             logger.info(f"   Retrieve time: {retrieve_pct:.1f}% of total")
             logger.info(f"   Verify time: {verify_pct:.1f}% of total")
 
             # Identify the bottleneck
             max_phase = max(
-                [("Wait", phase_breakdown['total_wait_time_ms']),
+                [("Pre-compute", pre_compute_time * 1000),
+                 ("Wait", phase_breakdown['total_wait_time_ms']),
                  ("Retrieve", phase_breakdown['total_retrieve_time_ms']),
                  ("Verify", phase_breakdown['total_verify_time_ms'])],
                 key=lambda x: x[1])
@@ -546,14 +626,19 @@ def run_receiver(args, config, metadata, tokens, retrieved_cache, slot_mapping,
                 f"   🚨 BOTTLENECK: {max_phase[0]} phase ({max_phase[1]:.2f}ms)"
             )
 
+        # Key computation efficiency analysis
+        estimated_per_layer_key_compute = pre_compute_time / len(layers_data) if layers_data else 0
+        total_saved_time = estimated_per_layer_key_compute * len(processed_layers) * 1000
+        logger.info(f"\n🎯 KEY COMPUTATION EFFICIENCY:")
+        logger.info(f"   Estimated per-layer key computation time: {estimated_per_layer_key_compute*1000:.2f}ms")
+        logger.info(f"   Total time saved by pre-computing: {total_saved_time:.2f}ms")
+        logger.info(f"   Efficiency improvement: {total_saved_time / (total_time*1000) * 100:.1f}% of total time")
+
         # Per-layer analysis - show slowest layers
         wait_times = detailed_metrics["per_layer_wait_times"]
         retrieve_times = detailed_metrics["per_layer_retrieve_times"]
 
         if wait_times:
-            # slowest_wait_layers = sorted(wait_times.items(),
-            #                              key=lambda x: x[1],
-            #                              reverse=True)[:5]
             # record all >1s
             slowest_wait_layers = [
                 (layer_id, wait_time)
@@ -568,9 +653,6 @@ def run_receiver(args, config, metadata, tokens, retrieved_cache, slot_mapping,
             logger.info(f"   Total wait time: {total_wait_time:.2f}ms")
 
         if retrieve_times:
-            # slowest_retrieve_layers = sorted(retrieve_times.items(),
-            #                                  key=lambda x: x[1],
-            #                                  reverse=True)[:5]
             slowest_retrieve_layers = [
                 (layer_id, retrieve_time)
                 for layer_id, retrieve_time in retrieve_times.items()
@@ -697,7 +779,8 @@ def run_receiver(args, config, metadata, tokens, retrieved_cache, slot_mapping,
         "total_time_ms": total_time * 1000,
         "avg_time_per_layer_ms": metrics['avg_time_per_layer_ms'],
         "verification_passed": passed,
-        "verification_total": len(verification_results)
+        "verification_total": len(verification_results),
+        "pre_compute_time_ms": pre_compute_time * 1000
     }
 
 
@@ -728,6 +811,11 @@ if __name__ == "__main__":
     parser.add_argument('--debug',
                         action='store_true',
                         help='Enable detailed debugging output')
+    parser.add_argument('--retrieval-method',
+                        type=str,
+                        choices=['individual', 'bulk'],
+                        default='individual',
+                        help='Retrieval method for receiver: individual (with pre-computed keys) or bulk progressive')
 
     args = parser.parse_args()
 
