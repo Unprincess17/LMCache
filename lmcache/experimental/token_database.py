@@ -283,6 +283,12 @@ class LayerFirstTokenDataBase(ChunkedTokenDatabase):
     This token database is used to convert tokens into layer first cache engine keys.
     It processes tokens in a layer-first manner, where each layer's tokens are processed
     separately and returned as a list of (start_idx, end_idx, key) tuples.
+    
+    Improved hash calculation design:
+    1. First compute chunk hashes: chunk_hash_i = hash(prefix_hash, chunk_i)
+    2. Then derive layer hashes: layer_hash = hash(chunk_hash, layer_id)
+    
+    This creates a hierarchical structure that's compatible with prefix caching in LLM serving systems.
     """
 
     def __init__(self, config: LMCacheEngineConfig,
@@ -300,89 +306,37 @@ class LayerFirstTokenDataBase(ChunkedTokenDatabase):
                                    base_key.world_size, base_key.worker_id,
                                    base_key.chunk_hash, layer_id)
 
-    def _hash(self, tokens: Union[torch.Tensor, List[int]], prefix_hash: str,
-              **kwargs) -> str:
-        """Override to include layer ID in the hash when provided"""
-        # Get the base hash from parent class
-        base_hash = super()._hash(tokens, prefix_hash)
-
-        # If layer_id is provided via kwargs, include it in the hash
-        layer_id = kwargs.get('layer_id')
-        if layer_id is not None:
-            hasher = hashlib.sha256()
-            hasher.update(base_hash.encode("ascii"))
-            hasher.update(str(layer_id).encode("ascii"))
-            return hasher.hexdigest()
-
-        return base_hash
-
-    def _prefix_hash(
-        self,
-        token_chunks: Iterable[Union[torch.Tensor, List[int]]],
-        **kwargs,
-    ) -> Iterable[str]:
-        """Override to pass layer_id through to _hash for optimization"""
-        prefix_hash = self._get_init_hash()
-        for token_chunk in token_chunks:
-            prefix_hash = self._hash(token_chunk, prefix_hash, **kwargs)
-            yield prefix_hash
-
-    def process_tokens_for_layer(
-        self,
-        tokens: Union[torch.Tensor, List[int]],
-        layer_id: int,
-        mask: Optional[torch.Tensor] = None,
-        make_key: bool = True
-    ) -> Iterable[Tuple[int, int, Union[CacheEngineKey, str]]]:
+    def _layer_hash(self, chunk_hash: str, layer_id: int) -> str:
         """
-        Process tokens for a specific layer only, avoiding unnecessary computation.
-        
-        This is more efficient than process_tokens when only one layer is needed,
-        as it avoids processing tokens for all layers.
+        Compute layer-specific hash from chunk hash.
         
         Args:
-            tokens: Input tokens to process
-            layer_id: Specific layer ID to process
-            mask: Optional mask for the tokens
-            make_key: Whether to create CacheEngineKey or just return hash string
+            chunk_hash: Base chunk hash
+            layer_id: Layer ID to include in hash
             
         Returns:
-            An iterable of (start_idx, end_idx, key) tuples for the specified layer only
+            Layer-specific hash string
         """
-        if isinstance(tokens, list):
-            tokens = torch.tensor(tokens)
+        hasher = hashlib.sha256()
+        hasher.update(chunk_hash.encode("ascii"))
+        hasher.update(str(layer_id).encode("ascii"))
+        return hasher.hexdigest()
 
-        # Batch CPU transfer - do this once at the beginning
-        if isinstance(tokens, torch.Tensor) and tokens.is_cuda:
-            tokens = tokens.cpu()
-
-        # Calculate num_falses once outside the loop
-        num_falses = 0
-        if mask is not None:
-            num_falses = mask.numel() - mask.long().sum().item()
-
-        with NVTXContext("token_sub_processing_setup"):
-            # Process tokens in chunks using parent class's chunking
-            token_chunks = self._chunk_tokens(tokens)
-            prefix_hashes = self._prefix_hash(token_chunks, layer_id=layer_id)
-
-        start_idx = 0
-        for chunk_id, prefix_hash in enumerate(prefix_hashes):
-            start_idx = chunk_id * self.chunk_size
-            end_idx = min(start_idx + self.chunk_size, len(tokens))
-
-            # Skip chunks that are masked out
-            if mask is not None and start_idx < num_falses:
-                continue
-
-            # Process only the specified layer instead of all layers
-            if make_key:
-                # prefix_hash already includes layer_id, so use it directly
-                yield start_idx, end_idx, self._make_key_by_hash(
-                    prefix_hash, layer_id)
-            else:
-                # Just return the layer-specific hash that's already computed
-                yield start_idx, end_idx, prefix_hash
+    def _prefix_chunk_hash(
+        self,
+        token_chunks: Iterable[Union[torch.Tensor, List[int]]],
+    ) -> Iterable[str]:
+        """
+        Compute progressive chunk hashes without layer information.
+        This creates the base chunk hash chain that can be reused across layers.
+        
+        Args:
+            token_chunks: Iterable of token chunks
+            
+        Yields:
+            Progressive chunk hash for each chunk
+        """
+        return super()._prefix_hash(token_chunks)
 
     def process_tokens(
         self,
@@ -391,7 +345,7 @@ class LayerFirstTokenDataBase(ChunkedTokenDatabase):
         make_key: bool = True
     ) -> Iterable[Tuple[int, int, Union[CacheEngineKey, str]]]:
         """
-        Process the tokens in a layer-first manner.
+        Process the tokens in a layer-first manner using improved hash calculation.
         
         Args:
             tokens: Input tokens to process
@@ -417,41 +371,27 @@ class LayerFirstTokenDataBase(ChunkedTokenDatabase):
             # Process tokens in chunks using parent class's chunking
             token_chunks = self._chunk_tokens(tokens)
 
-        # Maintain layer-specific prefix hash state to match process_tokens_for_layer behavior
-        layer_prefix_hashes = {
-            layer_id: self._get_init_hash()
-            for layer_id in range(self.num_layers)
-        }
+        # First, compute all chunk hashes (can be reused across layers)
+        base_chunk_hashes = self._prefix_chunk_hash(token_chunks)
 
         start_idx = 0
-        # Iterate over chunks, computing layer-specific hashes on-the-fly
-        for chunk_id, token_chunk in enumerate(token_chunks):
-            start_idx = chunk_id * self.chunk_size
-            end_idx = min(start_idx + self.chunk_size, len(tokens))
+        # Iterate over chunks, computing layer-specific hashes efficiently
+        for chunk_id, base_chunk_hash in enumerate(base_chunk_hashes):
+            with NVTXContext("per chunk token key"):
+                start_idx = chunk_id * self.chunk_size
+                end_idx = min(start_idx + self.chunk_size, len(tokens))
 
-            # Skip chunks that are masked out
-            if mask is not None and start_idx < num_falses:
-                # Still need to update prefix hashes even for masked chunks to maintain consistency
-                for layer_id in range(self.num_layers):
-                    layer_prefix_hashes[layer_id] = self._hash(
-                        token_chunk,
-                        layer_prefix_hashes[layer_id],
-                        layer_id=layer_id)
-                continue
+                # Skip chunks that are masked out
+                if mask is not None and start_idx < num_falses:
+                    continue
 
-            # For each layer, compute the current prefix hash and yield result
-            for layer_id in range(self.num_layers):
-                # Update the prefix hash for this layer (same as process_tokens_for_layer)
-                layer_prefix_hashes[layer_id] = self._hash(
-                    token_chunk,
-                    layer_prefix_hashes[layer_id],
-                    layer_id=layer_id)
-                current_prefix_hash = layer_prefix_hashes[layer_id]
+                with NVTXContext("per layer token key"):
+                    # For each layer, compute the layer-specific hash from chunk hash
+                    for layer_id in range(self.num_layers):
+                        layer_hash = self._layer_hash(base_chunk_hash, layer_id)
 
-                if make_key:
-                    # Use the prefix_hash directly (same as process_tokens_for_layer)
-                    yield start_idx, end_idx, self._make_key_by_hash(
-                        current_prefix_hash, layer_id)
-                else:
-                    # Just return the layer-specific hash
-                    yield start_idx, end_idx, current_prefix_hash
+                        if make_key:
+                            yield start_idx, end_idx, self._make_key_by_hash(
+                                layer_hash, layer_id)
+                        else:
+                            yield start_idx, end_idx, layer_hash
