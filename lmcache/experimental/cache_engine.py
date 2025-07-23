@@ -953,40 +953,6 @@ class LayerAwareLMCacheEngine(LMCacheEngine):
 
     @_lmcache_nvtx_annotate
     @torch.inference_mode()
-    def _get_layer_keys_for_single_layer(
-            self,
-            layer_id: int,
-            tokens: torch.Tensor,
-            mask: Optional[torch.Tensor] = None) -> List[tuple]:
-        """
-        Get layer keys for a specific layer only, avoiding unnecessary computation.
-        
-        
-        Args:
-            layer_id: The specific layer ID to get keys for
-            tokens: Input tokens to process
-            mask: Optional mask for the tokens
-            
-        Returns:
-            List of (start, end, layer_key) tuples for the specified layer only
-        """
-        layer_chunks = []
-
-        # Use the optimized layer-specific method
-        with NVTXContext("token_processing_setup_single_layer"):
-            token_processor = self.token_database.process_tokens_for_layer(
-                tokens, layer_id, mask)
-
-        for start, end, layer_key in token_processor:
-            with NVTXContext(f"process_token_chunk_layer_{layer_id}"):
-                assert isinstance(layer_key, LayerCacheEngineKey)
-                assert layer_key.layer_id == layer_id
-                layer_chunks.append((start, end, layer_key))
-
-        return layer_chunks
-
-    @_lmcache_nvtx_annotate
-    @torch.inference_mode()
     def store_progressive_layers(self,
                                  tokens: torch.Tensor,
                                  mask: Optional[torch.Tensor] = None,
@@ -1088,7 +1054,8 @@ class LayerAwareLMCacheEngine(LMCacheEngine):
     def _store_single_layer_progressive(self, layer_id: int,
                                         layer_chunks: List[tuple],
                                         memory_format: MemoryFormat,
-                                        using_nixl: bool, **kwargs) -> int:
+                                        using_nixl: bool,
+                                        **kwargs) -> int:
         """
         Store a single layer with progressive transfer capability.
         
@@ -1113,9 +1080,12 @@ class LayerAwareLMCacheEngine(LMCacheEngine):
             f"using {memory_format} format")
 
         if using_nixl:
-            # RDMA path: each layer gets its own register->flush cycle
-            layer_stored = self._store_layer_rdma(layer_id, layer_chunks,
-                                                  memory_format, **kwargs)
+            if kwargs.get("use_combined_memory", True):
+                layer_stored = self._store_layer_rdma(layer_id, layer_chunks,
+                                                      memory_format, **kwargs)
+            else:
+                layer_stored = self._store_layer_single(layer_id, layer_chunks,
+                                                        memory_format, **kwargs)
         else:
             raise NotImplementedError("Non-RDMA store is not implemented")
 
@@ -1125,6 +1095,118 @@ class LayerAwareLMCacheEngine(LMCacheEngine):
         )
 
         return layer_stored
+
+    @_lmcache_nvtx_annotate
+    @torch.inference_mode()
+    def _store_layer_single(self, layer_id: int, layer_chunks: List[tuple],
+                          memory_format: MemoryFormat, **kwargs) -> int:
+        """
+        Store a single layer using individual chunk processing with from_gpu_single_layer.
+        
+        This is an alternative to _store_layer_rdma for ablation studies. Instead of
+        combining all chunks into a single memory object, this method just transfers the chunks together.
+        
+        Args:
+            layer_id: The layer ID to store
+            layer_chunks: List of (start, end, layer_key) tuples for this layer
+            memory_format: Memory format to use (KV_T2D or KV_2LTD)
+            **kwargs: Additional arguments for GPU connector
+            
+        Returns:
+            Number of chunks successfully stored for this layer
+        """
+        if not layer_chunks:
+            return 0
+
+        # Step 1: Filter out already cached chunks
+        valid_chunks = []
+        starts = []
+        ends = []
+
+        with NVTXContext("filter_chunks"):
+            for start, end, layer_key in layer_chunks:
+                if not self.storage_manager.contains(layer_key):
+                    valid_chunks.append((start, end, layer_key))
+                    starts.append(start)
+                    ends.append(end)
+
+        if not valid_chunks:
+            return 0
+
+        # Step 2: Prepare metadata for all chunks
+        chunk_keys = []
+        chunk_metadatas = []
+        
+        with NVTXContext("prepare_metadata"):
+            for start, end, layer_key in valid_chunks:
+                num_tokens = end - start
+                kv_shape = self.gpu_connector.get_shape(num_tokens)
+                kv_dtype = self.metadata.kv_dtype
+                
+                metadata = self.storage_manager.dry_allocate(
+                    kv_shape, kv_dtype, fmt=memory_format)
+                
+                if metadata is None:
+                    logger.warning(
+                        f"Failed to prepare metadata for layer {layer_id}, "
+                        f"chunk {start}:{end}")
+                    continue
+                    
+                chunk_keys.append(layer_key)
+                chunk_metadatas.append(metadata)
+
+        if not chunk_keys:
+            logger.warning(f"No valid metadata for layer {layer_id}")
+            return 0
+
+        # Step 3: Register all metadata at once
+        with NVTXContext("register_metadata"):
+            self.storage_manager.prepare_put(chunk_keys, chunk_metadatas)
+
+        # Step 4: Transfer data from GPU to memory objects. Instead of using a combined keys and memorys, we allocate them individually, and batch them together.
+        successful_chunks = 0
+        memory_objs = []
+        valid_keys = []
+
+        with NVTXContext("create memory_objs"):
+            # 1. generate memory_objs, starts, ends, layer_id. 
+            # 2. kv_caches, slot_mapping are passed in as kwargs.
+
+            for i, ((start, end, layer_key), metadata) in enumerate(zip(valid_chunks, chunk_metadatas)):
+                # Allocate memory for this individual chunk
+                memory_obj = self.storage_manager.allocate(
+                    metadata.shape, metadata.dtype, fmt=metadata.fmt)
+
+                memory_objs.append(memory_obj)
+                valid_keys.append(layer_key)
+                successful_chunks += 1
+                
+                # Update lookup server for p2p discovery (if enabled)
+                if self.lookup_server is not None:
+                    self.lookup_server.insert(layer_key)
+
+        with NVTXContext("gpu_to_memory_transfer"):
+            # Transfer data using from_gpu_single_layer for this individual chunk
+            try:
+                self.gpu_connector.from_gpu_single_layer(
+                    memory_objs, starts, ends, layer_id, **kwargs)
+            except Exception as e:
+                logger.error(f"Failed to transfer GPU data: {e}")
+
+        # Step 5: Store all chunks in batch
+        with NVTXContext("batch_store"):
+            if memory_objs:
+                self.storage_manager.batched_put(valid_keys, memory_objs)
+                logger.debug(
+                    f"Stored {len(memory_objs)} individual chunks for layer {layer_id}")
+
+        # Step 6: Flush operations
+        with NVTXContext("flush"):
+            self.storage_manager.commit_put()
+
+        logger.debug(
+            f"Successfully stored {successful_chunks} individual chunks for layer {layer_id}")
+        return successful_chunks
 
     @_lmcache_nvtx_annotate
     @torch.inference_mode()
@@ -1155,7 +1237,7 @@ class LayerAwareLMCacheEngine(LMCacheEngine):
         valid_chunks = []
         total_tokens = 0
 
-        with NVTXContext("filter_and_calculate"):
+        with NVTXContext("filter"):
             for start, end, layer_key in layer_chunks:
                 if not self.storage_manager.contains(layer_key):
                     valid_chunks.append((start, end, layer_key))
@@ -1328,16 +1410,9 @@ class LayerAwareLMCacheEngine(LMCacheEngine):
         memory_format = self._get_memory_format_for_connector()
 
         # Get layer-specific chunks - use pre-computed if available, otherwise compute on-demand
-        if layers_data is not None and layer_id in layers_data:
-            layer_chunks = layers_data[layer_id]
-            logger.debug(
-                f"Using pre-computed layer chunks for layer {layer_id}")
-        else:
-            # Fallback to on-demand computation for backward compatibility
-            layer_chunks = self._get_layer_keys_for_single_layer(
-                layer_id, tokens, mask)
-            logger.debug(
-                f"Computing layer chunks on-demand for layer {layer_id}")
+        assert layers_data is not None and layer_id in layers_data, \
+            f"Layer {layer_id} not found in layers_data"
+        layer_chunks = layers_data[layer_id]
 
         if not layer_chunks:
             logger.debug(f"No data for layer {layer_id}")

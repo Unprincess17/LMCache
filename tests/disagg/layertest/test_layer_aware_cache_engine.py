@@ -357,7 +357,8 @@ def run_sender(args, config, metadata, tokens, kv_cache, slot_mapping, engine):
     engine.store_progressive_layers(tokens=tokens,
                                     notify_readiness=True,
                                     kvcaches=kv_cache,
-                                    slot_mapping=slot_mapping)
+                                    slot_mapping=slot_mapping,
+                                    use_combined_memory=False)
 
     end_time = time.time()
     elapsed_time = end_time - start_time
