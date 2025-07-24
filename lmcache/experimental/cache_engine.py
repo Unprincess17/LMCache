@@ -1054,8 +1054,7 @@ class LayerAwareLMCacheEngine(LMCacheEngine):
     def _store_single_layer_progressive(self, layer_id: int,
                                         layer_chunks: List[tuple],
                                         memory_format: MemoryFormat,
-                                        using_nixl: bool,
-                                        **kwargs) -> int:
+                                        using_nixl: bool, **kwargs) -> int:
         """
         Store a single layer with progressive transfer capability.
         
@@ -1084,8 +1083,8 @@ class LayerAwareLMCacheEngine(LMCacheEngine):
                 layer_stored = self._store_layer_rdma(layer_id, layer_chunks,
                                                       memory_format, **kwargs)
             else:
-                layer_stored = self._store_layer_single(layer_id, layer_chunks,
-                                                        memory_format, **kwargs)
+                layer_stored = self._store_layer_single(
+                    layer_id, layer_chunks, memory_format, **kwargs)
         else:
             raise NotImplementedError("Non-RDMA store is not implemented")
 
@@ -1099,7 +1098,7 @@ class LayerAwareLMCacheEngine(LMCacheEngine):
     @_lmcache_nvtx_annotate
     @torch.inference_mode()
     def _store_layer_single(self, layer_id: int, layer_chunks: List[tuple],
-                          memory_format: MemoryFormat, **kwargs) -> int:
+                            memory_format: MemoryFormat, **kwargs) -> int:
         """
         Store a single layer using individual chunk processing with from_gpu_single_layer.
         
@@ -1136,22 +1135,23 @@ class LayerAwareLMCacheEngine(LMCacheEngine):
         # Step 2: Prepare metadata for all chunks
         chunk_keys = []
         chunk_metadatas = []
-        
+
         with NVTXContext("prepare_metadata"):
             for start, end, layer_key in valid_chunks:
                 num_tokens = end - start
                 kv_shape = self.gpu_connector.get_shape(num_tokens)
                 kv_dtype = self.metadata.kv_dtype
-                
-                metadata = self.storage_manager.dry_allocate(
-                    kv_shape, kv_dtype, fmt=memory_format)
-                
+
+                metadata = self.storage_manager.dry_allocate(kv_shape,
+                                                             kv_dtype,
+                                                             fmt=memory_format)
+
                 if metadata is None:
                     logger.warning(
                         f"Failed to prepare metadata for layer {layer_id}, "
                         f"chunk {start}:{end}")
                     continue
-                    
+
                 chunk_keys.append(layer_key)
                 chunk_metadatas.append(metadata)
 
@@ -1169,18 +1169,20 @@ class LayerAwareLMCacheEngine(LMCacheEngine):
         valid_keys = []
 
         with NVTXContext("create memory_objs"):
-            # 1. generate memory_objs, starts, ends, layer_id. 
+            # 1. generate memory_objs, starts, ends, layer_id.
             # 2. kv_caches, slot_mapping are passed in as kwargs.
 
-            for i, ((start, end, layer_key), metadata) in enumerate(zip(valid_chunks, chunk_metadatas)):
+            for i, ((start, end, layer_key),
+                    metadata) in enumerate(zip(valid_chunks, chunk_metadatas)):
                 # Allocate memory for this individual chunk
-                memory_obj = self.storage_manager.allocate(
-                    metadata.shape, metadata.dtype, fmt=metadata.fmt)
+                memory_obj = self.storage_manager.allocate(metadata.shape,
+                                                           metadata.dtype,
+                                                           fmt=metadata.fmt)
 
                 memory_objs.append(memory_obj)
                 valid_keys.append(layer_key)
                 successful_chunks += 1
-                
+
                 # Update lookup server for p2p discovery (if enabled)
                 if self.lookup_server is not None:
                     self.lookup_server.insert(layer_key)
@@ -1198,14 +1200,16 @@ class LayerAwareLMCacheEngine(LMCacheEngine):
             if memory_objs:
                 self.storage_manager.batched_put(valid_keys, memory_objs)
                 logger.debug(
-                    f"Stored {len(memory_objs)} individual chunks for layer {layer_id}")
+                    f"Stored {len(memory_objs)} individual chunks for layer {layer_id}"
+                )
 
         # Step 6: Flush operations
         with NVTXContext("flush"):
             self.storage_manager.commit_put()
 
         logger.debug(
-            f"Successfully stored {successful_chunks} individual chunks for layer {layer_id}")
+            f"Successfully stored {successful_chunks} individual chunks for layer {layer_id}"
+        )
         return successful_chunks
 
     @_lmcache_nvtx_annotate

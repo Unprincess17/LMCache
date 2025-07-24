@@ -354,11 +354,13 @@ def run_sender(args, config, metadata, tokens, kv_cache, slot_mapping, engine):
     start_time = time.time()
 
     # Use progressive layer storage - this will send layers in layer-first order
-    engine.store_progressive_layers(tokens=tokens,
-                                    notify_readiness=True,
-                                    kvcaches=kv_cache,
-                                    slot_mapping=slot_mapping,
-                                    use_combined_memory=False)
+    engine.store_progressive_layers(
+        tokens=tokens,
+        notify_readiness=True,
+        kvcaches=kv_cache,
+        slot_mapping=slot_mapping,
+        use_combined_memory=True  # Ablation study for combined key
+    )
 
     end_time = time.time()
     elapsed_time = end_time - start_time

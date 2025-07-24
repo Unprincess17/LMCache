@@ -41,11 +41,12 @@ if not BUILDING_SDIST:
             'lmcache.c_ops',
             [
                 'csrc/pybind.cpp', 'csrc/mem_kernels.cu', 'csrc/cal_cdf.cu',
-                'csrc/ac_enc.cu', 'csrc/ac_dec.cu', 'csrc/pos_kernels.cu'
+                'csrc/ac_enc.cu', 'csrc/ac_dec.cu', 'csrc/pos_kernels.cu',
+                'csrc/chunk_processor.cpp'
             ],
             extra_compile_args={
-                'cxx': ['-D_GLIBCXX_USE_CXX11_ABI=0'],
-                'nvcc': ['-D_GLIBCXX_USE_CXX11_ABI=0']
+                'cxx': ['-D_GLIBCXX_USE_CXX11_ABI=0', '-std=c++17'],
+                'nvcc': ['-D_GLIBCXX_USE_CXX11_ABI=0', '-std=c++17']
             },
         ),
     ]

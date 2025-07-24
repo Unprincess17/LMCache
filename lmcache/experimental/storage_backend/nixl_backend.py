@@ -265,31 +265,26 @@ class LayerAwareNixlObserver(NixlObserverInterface):
         # Track layers that become ready in this batch
         newly_ready_layers = set()
 
+        tensors_to_clone = []
+        keys_to_store = []
+        num_chunks = 0
+
         # Process each received object
         for key, obj in zip(keys, objs):
-            # Store in object pool if provided and determine the object to use for chunk extraction
-            stored_obj = obj  # Default to original object
-            if self.obj_pool is not None:
+            # Case 1: one Combined key
+            if isinstance(key, CombinedLayerCacheEngineKey):
+                # enables individual keys to find their combined objects
+                layer_id = key.layer_id
+                copied_obj = None
                 if is_view:
-                    # Clone the tensor since it's a view that will be overwritten
                     assert obj.tensor is not None, \
                             "The tensor in the MemoryObj is None."
                     copied_obj = TensorMemoryObj(obj.tensor.clone(),
                                                  obj.metadata)
-                    if not isinstance(key, CombinedLayerCacheEngineKey):
-                        self.obj_pool.add(key, copied_obj)
-                    stored_obj = copied_obj  # Use the cloned object for chunk extraction
                 else:
-                    if not isinstance(key, CombinedLayerCacheEngineKey):
-                        self.obj_pool.add(key, obj)
-                    stored_obj = obj  # Use the original object
-
-            # Extract layer information if this is a layer-aware key
-            if isinstance(key, CombinedLayerCacheEngineKey):
-                # enables individual keys to find their combined objects
-                layer_id = key.layer_id
+                    copied_obj = obj
                 self._store_individual_chunks_from_combined_key(
-                    key, stored_obj)
+                    key, copied_obj)
 
                 # Mark layer as ready if expected
                 if layer_id < self.num_layers:
@@ -297,17 +292,69 @@ class LayerAwareNixlObserver(NixlObserverInterface):
                         self._mark_layer_ready(layer_id)
                         newly_ready_layers.add(layer_id)
 
-            elif isinstance(key, LayerCacheEngineKey):
-                layer_id = key.layer_id
-                if layer_id < self.num_layers:
-                    # Update chunk count for this layer
-                    self._layer_chunk_counts[layer_id] += key.chunk_num
+            else:
+                # Case 2: Normal single keys
+                with NVTXContext("store target keys"):
+                    if self.obj_pool is not None:
+                        if is_view:
+                            # Clone the tensor since it's a view that will be overwritten
+                            assert obj.tensor is not None, \
+                                    "The tensor in the MemoryObj is None."
 
-                    # Check if this layer is now complete
-                    if self._is_layer_complete(key, obj, layer_id):
-                        if not self._layer_ready_flags[layer_id]:
-                            self._mark_layer_ready(layer_id)
-                            newly_ready_layers.add(layer_id)
+                            tensors_to_clone.append(obj.tensor)
+                            keys_to_store.append(key)
+                            num_chunks += key.chunk_num
+                        else:
+                            if not isinstance(key,
+                                              CombinedLayerCacheEngineKey):
+                                self.obj_pool.add(key, obj)
+
+        # [Ablation] batch clone tensors
+        if len(tensors_to_clone) > 0:
+            with NVTXContext("batch clone tensors"):
+                total_size = sum(
+                    [tensor.numel() for tensor in tensors_to_clone])
+                device = tensors_to_clone[0].device
+                dtype = tensors_to_clone[0].dtype
+
+                # pre allocate buffer
+                large_buffer = torch.empty(total_size,
+                                           device=device,
+                                           dtype=dtype)
+
+                # copy all tensors to the buffer
+                offset = 0
+                tensor_slices = []
+                for tensor in tensors_to_clone:
+                    size = tensor.numel()
+                    large_buffer[offset:offset + size] = tensor.view(-1)
+                    tensor_slices.append((offset, offset + size))
+                    offset += size
+
+                cloned_objs = []
+                for i, (start, end) in enumerate(tensor_slices):
+                    cloned_tensor = large_buffer[start:end]
+                    cloned_obj = TensorMemoryObj(cloned_tensor,
+                                                 objs[i].metadata)
+                    cloned_objs.append(cloned_obj)
+
+                # add to the object pool
+                with NVTXContext("batch add to obj_pool"):
+                    self.obj_pool.batched_add(keys_to_store, cloned_objs)
+
+        # After fetch, update the status
+        if isinstance(keys[0], LayerCacheEngineKey):
+            layer_id = keys[0].layer_id
+            if layer_id < self.num_layers:
+                # Update chunk count for this layer
+                self._layer_chunk_counts[layer_id] = num_chunks
+
+            for key in keys:
+                # Check if this layer is now complete
+                if self._is_layer_complete(key, layer_id):
+                    if not self._layer_ready_flags[layer_id]:
+                        self._mark_layer_ready(layer_id)
+                        newly_ready_layers.add(layer_id)
 
         # Fire callbacks for newly ready layers
         for layer_id in newly_ready_layers:
@@ -316,6 +363,7 @@ class LayerAwareNixlObserver(NixlObserverInterface):
         logger.debug(f"NixlObserver processed {len(keys)} objects, "
                      f"{len(newly_ready_layers)} layers became ready")
 
+    @_lmcache_nvtx_annotate
     def _get_cached_key(self, chunk_key_str: str) -> LayerCacheEngineKey:
         """
         Get a cached LayerCacheEngineKey or parse and cache it if not present.
@@ -370,8 +418,21 @@ class LayerAwareNixlObserver(NixlObserverInterface):
         with NVTXContext("Batch parse chunk keys"):
             individual_keys = []
             for chunk_mapping in combined_key.chunk_mappings:
-                individual_key = self._get_cached_key(chunk_mapping.chunk_key)
+                # Option 1: No cache. fetch directly for each key
+                individual_key = LayerCacheEngineKey.from_string(
+                    chunk_mapping.chunk_key)
+                # # Option 2: cached key
+                # individual_key = self._get_cached_key(chunk_mapping.chunk_key)
                 individual_keys.append(individual_key)
+
+            # # Option 3: Parallel
+            # def _batch_parse_keys_parallel(chunk_mappings) -> List[LayerCacheEngineKey]:
+            #     from concurrent.futures import ThreadPoolExecutor
+            #     with ThreadPoolExecutor(max_workers=8) as executor:
+            #         futures = [executor.submit(self._get_cached_key, chunk_mapping.chunk_key) for chunk_mapping in chunk_mappings]
+            #         return [future.result() for future in futures]
+
+            # individual_keys = _batch_parse_keys_parallel(combined_key.chunk_mappings)
 
         with NVTXContext("Pre-allocate batch data"):
             chunk_objects = []
@@ -381,46 +442,90 @@ class LayerAwareNixlObserver(NixlObserverInterface):
             slice_positions = [(mapping.offset_start, mapping.offset_end)
                                for mapping in combined_key.chunk_mappings]
 
-        # Extract each chunk mapping and prepare objects for batched storage
-        for i, (slice_pos, individual_key) in enumerate(
-                zip(slice_positions, individual_keys)):
+        # Use accelerated chunk processing to bypass Python GIL
+        with NVTXContext("Accelerated chunk processing"):
             try:
-                with NVTXContext(f"Process chunk {i}"):
-                    # Extract the specific chunk from the combined memory object
-                    with NVTXContext("Extract chunk"):
-                        chunk_tensor = combined_tensor[
-                            slice_pos[0]:slice_pos[1]]
+                # Import the accelerated chunk processor
+                from .chunk_processor import ChunkProcessor, get_optimal_chunk_processor, configure_chunk_processing_threads
 
-                    with NVTXContext("Create metadata"):
-                        chunk_metadata = MemoryObjMetadata(
-                            shape=chunk_tensor.shape,
-                            dtype=chunk_tensor.dtype,
-                            address=chunk_tensor.data_ptr(),
-                            phy_size=chunk_tensor.numel() *
-                            chunk_tensor.element_size(),
-                            ref_count=1,  # Start with ref count 1
-                            is_pin=False,
-                            fmt=base_format)  # Use pre-calculated format
+                # Configure chunk processing parallel degree
+                configure_chunk_processing_threads(8)
 
-                    with NVTXContext("Create TensorMemoryObj"):
-                        chunk_obj = TensorMemoryObj(
-                            raw_data=chunk_tensor,
-                            metadata=chunk_metadata,
-                            parent_allocator=parent_allocator)
+                # Determine optimal processing method
+                processor_type = get_optimal_chunk_processor()
+                logger.debug(
+                    f"Using {processor_type} chunk processor for {len(slice_positions)} chunks"
+                )
 
-                    # Collect for batched storage instead of immediate obj_pool.add
-                    chunk_objects.append(chunk_obj)
-                    chunk_keys_for_batch.append(individual_key)
+                # Use the appropriate accelerated method
+                if processor_type == 'cpp':
+                    # C++ extension bypasses GIL completely
+                    chunk_tensors, chunk_metadatas = ChunkProcessor.process_chunks_cpp(
+                        combined_tensor, slice_positions, base_format,
+                        parent_allocator)
+                elif processor_type == 'cuda' and combined_tensor.is_cuda:
+                    # CUDA processing for GPU tensors
+                    chunk_tensors, chunk_metadatas = ChunkProcessor.process_chunks_cuda_kernel(
+                        combined_tensor, slice_positions, base_format,
+                        parent_allocator)
+                else:
+                    # Optimized Python fallback
+                    chunk_tensors, chunk_metadatas = ChunkProcessor._process_chunks_python_fallback(
+                        combined_tensor, slice_positions, base_format,
+                        parent_allocator)
+
+                # Create memory objects (this is fast and doesn't benefit much from parallelization)
+                chunk_objects = ChunkProcessor.create_memory_objects(
+                    chunk_tensors, chunk_metadatas, parent_allocator)
+
+                # Ensure we have the right number of objects
+                assert len(chunk_objects) == len(individual_keys), \
+                    f"Mismatch: {len(chunk_objects)} objects vs {len(individual_keys)} keys"
+
+                chunk_keys_for_batch = individual_keys
 
             except Exception as e:
-                logger.error(
-                    f"Failed to process chunk mapping for chunk {i}: {e}")
-                continue
+                # Fallback to original sequential processing if accelerated methods fail
+                logger.warning(
+                    f"Accelerated chunk processing failed: {e}, falling back to sequential"
+                )
+
+                chunk_objects = []
+                chunk_keys_for_batch = []
+
+                for i, (slice_pos, individual_key) in enumerate(
+                        zip(slice_positions, individual_keys)):
+                    try:
+                        with NVTXContext(f"Process chunk {i} (fallback)"):
+                            chunk_tensor = combined_tensor[
+                                slice_pos[0]:slice_pos[1]]
+
+                            chunk_metadata = MemoryObjMetadata(
+                                shape=chunk_tensor.shape,
+                                dtype=chunk_tensor.dtype,
+                                address=chunk_tensor.data_ptr(),
+                                phy_size=chunk_tensor.numel() *
+                                chunk_tensor.element_size(),
+                                ref_count=1,
+                                is_pin=False,
+                                fmt=base_format)
+
+                            chunk_obj = TensorMemoryObj(
+                                raw_data=chunk_tensor,
+                                metadata=chunk_metadata,
+                                parent_allocator=parent_allocator)
+
+                            chunk_objects.append(chunk_obj)
+                            chunk_keys_for_batch.append(individual_key)
+
+                    except Exception as inner_e:
+                        logger.error(f"Failed to process chunk {i}: {inner_e}")
+                        continue
 
         with NVTXContext("Batch add to obj_pool"):
             self.obj_pool.batched_add(chunk_keys_for_batch, chunk_objects)
 
-    def _is_layer_complete(self, key: LayerCacheEngineKey, obj: MemoryObj,
+    def _is_layer_complete(self, key: LayerCacheEngineKey,
                            layer_id: int) -> bool:
         """
         Determine if a layer is complete based on received data.
