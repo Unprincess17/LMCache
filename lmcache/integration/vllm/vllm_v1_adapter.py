@@ -26,8 +26,9 @@ from vllm.utils import cdiv, make_zmq_socket
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
 
-from lmcache.experimental.cache_engine import (LayerwiseLMCacheEngine,
+from lmcache.experimental.cache_engine import (LayerAwareLMCacheEngine, LayerwiseLMCacheEngine,
                                                LMCacheEngine)
+from lmcache.experimental.storage_backend.storage_manager import DistributedStorageManager
 from lmcache.integration.vllm.vllm_adapter import init_lmcache_engine
 from lmcache.logging import init_logger
 from lmcache.utils import _lmcache_nvtx_annotate
@@ -309,6 +310,7 @@ class LMCacheConnectorV1Impl:
                  parent: KVConnectorBase_V1):
         self._parent = parent
         self.kv_role = vllm_config.kv_transfer_config.kv_role
+        self.layers_data = None
         is_tp = vllm_config.parallel_config.tensor_parallel_size > 1
         if role == KVConnectorRole.SCHEDULER:
             self.lookup_client = LMCacheLookupClient(role, is_tp, vllm_config)
@@ -316,8 +318,8 @@ class LMCacheConnectorV1Impl:
             self.lmcache_engine = init_lmcache_engine(
                 vllm_config.model_config, vllm_config.parallel_config,
                 vllm_config.cache_config)
-            self.use_layerwise = isinstance(self.lmcache_engine,
-                                            LayerwiseLMCacheEngine)
+            self.use_layerwise = isinstance(self.lmcache_engine, LayerwiseLMCacheEngine)
+            self.use_layeraware = isinstance(self.lmcache_engine, LayerAwareLMCacheEngine)
 
             # NOTE: Only create the KV lookup API server on worker rank 0
             # when there are multiple workers
@@ -404,6 +406,8 @@ class LMCacheConnectorV1Impl:
         assert self.lmcache_engine is not None
 
         self.layerwise_retrievers = []
+        self.layers_data_by_request = {}  # Store layers_data for each request
+        
         for request in metadata.requests:
             if request.load_spec is None:
                 continue
@@ -434,6 +438,23 @@ class LMCacheConnectorV1Impl:
                 next(layerwise_retriever)
                 next(layerwise_retriever)
                 self.layerwise_retrievers.append(layerwise_retriever)
+            elif self.use_layeraware:
+                # For LayerAwareLMCacheEngine, we need to group keys by layers first
+                # and store the data for later use in wait_for_layer_load
+                layers_data = self.lmcache_engine._group_keys_by_layers_first(
+                    tokens,
+                    token_mask,
+                )
+                self.layers_data_by_request[request.req_id] = {
+                    'layers_data': layers_data,
+                    'tokens': tokens,
+                    'token_mask': token_mask,
+                    'slot_mapping': slot_mapping,
+                    'kvcaches': kvcaches,
+                }
+                logger.debug(
+                    f"Prepared layer-aware data for request {request.req_id}: "
+                    f"{len(layers_data)} layers with data")
             else:
                 ret_token_mask = self.lmcache_engine.retrieve(
                     tokens,
@@ -460,26 +481,100 @@ class LMCacheConnectorV1Impl:
         """Blocking until the KV for a specific layer is loaded into vLLM's
         paged buffer. 
         
-        This interface will be useful for layer-by-layer pipelining.
+        Enhanced for LayerAwareLMCacheEngine: This method now supports progressive
+        layer loading where individual layers become available one by one.
+        Instead of waiting for the entire KV cache, we wait only for the specific
+        layer needed by the current attention computation.
 
         Args:
-            layer_name: the name of that layer
+            layer_name: the name of that layer (e.g. "layers.0", "layers.1")
         """
-        if self.layerwise_retrievers:
-            logger.debug(
-                f"Waiting for layer {self.current_layer} to be loaded")
+        # Parse layer ID from layer name (e.g. "layers.0" -> 0)
+        layer_id = self._parse_layer_id(layer_name)
+        
+        if self.use_layeraware:
+            # Get the metadata to access request information
+            metadata = self._parent._get_connector_metadata()
+            assert isinstance(metadata, LMCacheConnectorMetadata)
+            
+            # Process each request that needs layer loading
+            for request in metadata.requests:
+                if request.load_spec is None or not request.load_spec.can_load:
+                    continue
 
-        # Wait for the layer to be loaded
+                # Get the stored data for this request
+                if request.req_id not in self.layers_data_by_request:
+                    logger.warning(f"No layer data found for request {request.req_id}")
+                    continue
+                
+                request_data = self.layers_data_by_request[request.req_id]
+                tokens = request_data['tokens']
+                token_mask = request_data['token_mask']
+                slot_mapping = request_data['slot_mapping']
+                kvcaches = request_data['kvcaches']
+                layers_data = request_data['layers_data']
+                
+                # Calculate number of chunks based on token length
+                num_chunks = len(tokens) // self._lmcache_chunk_size
+                if len(tokens) % self._lmcache_chunk_size != 0:
+                    num_chunks += 1
+                
+                ret_mask = self.lmcache_engine.retrieve_layer_when_ready(
+                    layer_id,
+                    tokens,
+                    token_mask,
+                    timeout_us=self._get_layer_timeout_us(),
+                    layers_data=layers_data,
+                    num_chunks=num_chunks
+                )
+                
+                # Log the result for debugging
+                if ret_mask is not None:
+                    num_retrieved_tokens = ret_mask.sum().item()
+                    logger.debug(f"Retrieved {num_retrieved_tokens} tokens for layer {layer_id} in request {request.req_id}")
+                else:
+                    logger.debug(f"No tokens retrieved for layer {layer_id} in request {request.req_id}")
+        elif self.layerwise_retrievers:
+            self._wait_using_retrievers(layer_id)
+
+    def _parse_layer_id(self, layer_name: str) -> int:
+        """
+        Parse layer ID from layer name.
+        
+        Args:
+            layer_name: Layer name like "layers.0", "layers.1", etc.
+            
+        Returns:
+            Layer ID as integer
+        """
+        try:
+            import re
+            numbers = re.findall(r'\d+', layer_name)
+            return int(numbers[-1]) if numbers else 0
+        except (ValueError, IndexError):
+            logger.warning(f"Could not parse layer ID from {layer_name}, defaulting to 0")
+            return 0
+
+    def _wait_using_retrievers(self, target_layer_id: int) -> None:
+        """
+        Wait for layer using the layerwise retrievers (original method).
+        
+        Args:
+            target_layer_id: The layer ID to wait for
+        """
+        # Wait for the layer to be loaded using retrievers
         for layerwise_retriever in self.layerwise_retrievers:
+            # Process layers up to the target layer
+            for current_layer in range(target_layer_id + 1):
+                if current_layer <= self.current_layer:
+                    continue  # Already processed
+                    
+                ret_token_mask = next(layerwise_retriever)
 
-            ret_token_mask = next(layerwise_retriever)
-
-            if self.current_layer == self.num_layers - 1:
-                assert ret_token_mask is not None
-                num_retrieved_tokens = ret_token_mask.sum().item()
-                logger.info(f"Retrieved {num_retrieved_tokens} tokens")
-
-        return
+                if current_layer == self.num_layers - 1:
+                    assert ret_token_mask is not None
+                    num_retrieved_tokens = ret_token_mask.sum().item()
+                    logger.debug(f"Retrieved {num_retrieved_tokens} tokens for final layer")
 
     def save_kv_layer(self, layer_name: str, kv_layer: torch.Tensor,
                       attn_metadata: "AttentionMetadata", **kwargs) -> None:
@@ -494,7 +589,7 @@ class LMCacheConnectorV1Impl:
             **kwargs: additional arguments for the save operation.
         """
 
-        if not self.use_layerwise:
+        if not self.use_layerwise and not self.use_layeraware:
             return
 
         if self.kv_role == "kv_consumer":
@@ -506,59 +601,159 @@ class LMCacheConnectorV1Impl:
 
         assert len(self.kv_caches) > 0
 
-        assert isinstance(self.lmcache_engine, LayerwiseLMCacheEngine)
+        assert isinstance(self.lmcache_engine, (LayerwiseLMCacheEngine, LayerAwareLMCacheEngine))
 
         kvcaches = list(self.kv_caches.values())
-        if self.current_layer == 0:
-            self.layerwise_storers = []
-            for request in connector_metadata.requests:
-                save_spec = request.save_spec
-                if save_spec is None or not save_spec.can_save:
-                    continue
+        
+        if self.use_layeraware:
+            # LayerAwareLMCacheEngine uses direct method calls for single layer storage
+            if self.current_layer == 0:
+                # Initialize layer-aware storage data for all requests
+                self.layeraware_request_data = {}
+                for request in connector_metadata.requests:
+                    save_spec = request.save_spec
+                    if save_spec is None or not save_spec.can_save:
+                        continue
 
-                token_ids = request.token_ids
-                assert isinstance(token_ids, torch.Tensor)
-                assert token_ids.is_cpu
+                    token_ids = request.token_ids
+                    assert isinstance(token_ids, torch.Tensor)
+                    assert token_ids.is_cpu
 
-                slot_mapping = request.slot_mapping
-                assert isinstance(slot_mapping, torch.Tensor)
-                assert len(slot_mapping) == len(token_ids)
+                    slot_mapping = request.slot_mapping
+                    assert isinstance(slot_mapping, torch.Tensor)
+                    assert len(slot_mapping) == len(token_ids)
 
-                # TODO: have a pre-allocated buffer to hold the slot_mappings
-                slot_mapping = slot_mapping.cuda()
-                # NOTE: In PD setting, lmcache_engine.lookup() will always
-                # return 0 if there is no local storage configured.
-                # In this case, we should rely on the skip_leading_tokens in
-                # save_spec to avoid transmit the already saved tokens again.
-                skip_leading_tokens = max(
-                    self.lmcache_engine.lookup(token_ids),
-                    save_spec.skip_leading_tokens)
-                if skip_leading_tokens == len(token_ids):
-                    continue  # skip this request
-                # Align to lmcache chunk size
-                skip_leading_tokens = skip_leading_tokens // \
-                        self._lmcache_chunk_size * self._lmcache_chunk_size
+                    # TODO: have a pre-allocated buffer to hold the slot_mappings
+                    slot_mapping = slot_mapping.cuda()
+                    # NOTE: In PD setting, lmcache_engine.lookup() will always
+                    # return 0 if there is no local storage configured.
+                    # In this case, we should rely on the skip_leading_tokens in
+                    # save_spec to avoid transmit the already saved tokens again.
+                    skip_leading_tokens = max(
+                        self.lmcache_engine.lookup(token_ids),
+                        save_spec.skip_leading_tokens)
+                    if skip_leading_tokens == len(token_ids):
+                        continue  # skip this request
+                    # Align to lmcache chunk size
+                    skip_leading_tokens = skip_leading_tokens // \
+                            self._lmcache_chunk_size * self._lmcache_chunk_size
 
-                store_mask = torch.ones_like(token_ids, dtype=torch.bool)
-                store_mask[:skip_leading_tokens] = False
+                    store_mask = torch.ones_like(token_ids, dtype=torch.bool)
+                    store_mask[:skip_leading_tokens] = False
 
-                logger.info(
-                    "Storing KV cache for %d out of %d tokens for request %s",
-                    len(token_ids) - skip_leading_tokens, len(token_ids),
-                    request.req_id)
-                layerwise_storer = self.lmcache_engine.store_layer(
-                    token_ids,
-                    mask=store_mask,
-                    kvcaches=kvcaches,
-                    slot_mapping=slot_mapping,
-                    offset=skip_leading_tokens)
-                self.layerwise_storers.append(layerwise_storer)
+                    logger.info(
+                        "Storing KV cache for %d out of %d tokens for request %s",
+                        len(token_ids) - skip_leading_tokens, len(token_ids),
+                        request.req_id)
+                    
+                    # Group keys by layers first for LayerAwareLMCacheEngine
+                    layers_data = self.lmcache_engine._group_keys_by_layers_first(
+                        token_ids,
+                        store_mask,
+                    )
+                    
+                    # Store the data for each request
+                    self.layeraware_request_data[request.req_id] = {
+                        'layers_data': layers_data,
+                        'token_ids': token_ids,
+                        'store_mask': store_mask,
+                        'slot_mapping': slot_mapping,
+                        'kvcaches': kvcaches,
+                        'skip_leading_tokens': skip_leading_tokens,
+                    }
+            
+            # Process the current layer for all requests
+            current_layer_id = self.current_layer
+            for req_id, request_data in self.layeraware_request_data.items():
+                layers_data = request_data['layers_data']
+                token_ids = request_data['token_ids']
+                store_mask = request_data['store_mask']
+                slot_mapping = request_data['slot_mapping']
+                kvcaches = request_data['kvcaches']
+                skip_leading_tokens = request_data['skip_leading_tokens']
+                
+                # Check if this layer has data to store
+                if current_layer_id in layers_data:
+                    layer_chunks = layers_data[current_layer_id]
+                    
+                    # Determine memory format and RDMA usage
+                    memory_format = self.lmcache_engine._get_memory_format_for_connector()
+                    using_nixl = isinstance(self.lmcache_engine.storage_manager,
+                                            DistributedStorageManager)
+                    
+                    # Store this single layer
+                    layer_stored = self.lmcache_engine._store_single_layer_progressive(
+                        current_layer_id,
+                        layer_chunks,
+                        memory_format,
+                        using_nixl,
+                        kvcaches=kvcaches,
+                        slot_mapping=slot_mapping,
+                        offset=skip_leading_tokens,
+                        **kwargs
+                    )
+                    
+                    logger.debug(
+                        f"Stored {layer_stored} chunks for layer {current_layer_id} "
+                        f"in request {req_id}")
+                else:
+                    logger.debug(
+                        f"No data to store for layer {current_layer_id} "
+                        f"in request {req_id}")
+            
+            self.current_layer += 1
+            
+        else: # use layerwise; generator pattern
+            if self.current_layer == 0:
+                self.layerwise_storers = []
+                for request in connector_metadata.requests:
+                    save_spec = request.save_spec
+                    if save_spec is None or not save_spec.can_save:
+                        continue
 
-        for layerwise_storer in self.layerwise_storers:
-            next(layerwise_storer)
-            if self.current_layer == self.num_layers - 1:
+                    token_ids = request.token_ids
+                    assert isinstance(token_ids, torch.Tensor)
+                    assert token_ids.is_cpu
+
+                    slot_mapping = request.slot_mapping
+                    assert isinstance(slot_mapping, torch.Tensor)
+                    assert len(slot_mapping) == len(token_ids)
+
+                    # TODO: have a pre-allocated buffer to hold the slot_mappings
+                    slot_mapping = slot_mapping.cuda()
+                    # NOTE: In PD setting, lmcache_engine.lookup() will always
+                    # return 0 if there is no local storage configured.
+                    # In this case, we should rely on the skip_leading_tokens in
+                    # save_spec to avoid transmit the already saved tokens again.
+                    skip_leading_tokens = max(
+                        self.lmcache_engine.lookup(token_ids),
+                        save_spec.skip_leading_tokens)
+                    if skip_leading_tokens == len(token_ids):
+                        continue  # skip this request
+                    # Align to lmcache chunk size
+                    skip_leading_tokens = skip_leading_tokens // \
+                            self._lmcache_chunk_size * self._lmcache_chunk_size
+
+                    store_mask = torch.ones_like(token_ids, dtype=torch.bool)
+                    store_mask[:skip_leading_tokens] = False
+
+                    logger.info(
+                        "Storing KV cache for %d out of %d tokens for request %s",
+                        len(token_ids) - skip_leading_tokens, len(token_ids),
+                        request.req_id)
+                    layerwise_storer = self.lmcache_engine.store_layer(
+                        token_ids,
+                        mask=store_mask,
+                        kvcaches=kvcaches,
+                        slot_mapping=slot_mapping,
+                        offset=skip_leading_tokens)
+                    self.layerwise_storers.append(layerwise_storer)
+
+            for layerwise_storer in self.layerwise_storers:
                 next(layerwise_storer)
-        self.current_layer += 1
+                if self.current_layer == self.num_layers - 1:
+                    next(layerwise_storer)
+            self.current_layer += 1
 
     @_lmcache_nvtx_annotate
     def wait_for_save(self):
@@ -567,7 +762,7 @@ class LMCacheConnectorV1Impl:
             # Don't do save if the role is kv_consumer
             return
 
-        if self.use_layerwise:
+        if self.use_layerwise or self.use_layeraware:
             return
 
         connector_metadata = self._parent._get_connector_metadata()
@@ -595,7 +790,7 @@ class LMCacheConnectorV1Impl:
             slot_mapping = slot_mapping.cuda()
             # NOTE: In PD setting, lmcache_engine.lookup() will always return
             # 0 if there is no local storage configured. In this case, we
-            # should rely on the slip_leading_tokens in save_spec to avoid
+            # should rely on the skip_leading_tokens in save_spec to avoid
             # transmit the already saved tokens again.
             skip_leading_tokens = max(self.lmcache_engine.lookup(token_ids),
                                       save_spec.skip_leading_tokens)
@@ -626,9 +821,12 @@ class LMCacheConnectorV1Impl:
         self,
         request: "Request",
         num_computed_tokens: int,
-    ) -> int:
+    ) -> tuple[int, bool]:
         """
         Check for external KV cache hit.
+        
+        Enhanced for PD-disaggregated: Forces decoder to always fetch from prefiller
+        using retrieve_layer_when_ready with timeout-based coordination.
         
         Args:
             request (Request): the request object.
@@ -636,12 +834,39 @@ class LMCacheConnectorV1Impl:
                 computed tokens for this request
 
         Returns:
-            the number of tokens that can be loaded from the 
-            external KV cache beyond what is already computed.
+            Tuple of (num_tokens_available, should_load_async):
+            - num_tokens_available: number of tokens that can be loaded from external cache
+            - should_load_async: True to force async layer-wise loading
         """
         if self.kv_role == "kv_producer":
-            return 0
+            return 0, False
 
+        # Check if this is a PD-disaggregated setup (decoder fetching from prefiller)
+        is_pd_disaggregated = self._is_pd_disaggregated_mode()
+        
+        if is_pd_disaggregated:
+            # For PD-disaggregated: Always try to fetch from prefiller
+            # Estimate tokens that might be available (entire prompt initially)
+            estimated_tokens = self._estimate_tokens_from_prefiller(request, num_computed_tokens)
+            
+            if estimated_tokens > 0:
+                logger.info(
+                    "PD-Disaggregated: Reqid: %s, estimated %d tokens from prefiller, "
+                    "forcing async loading", request.request_id, estimated_tokens)
+                
+                # Set up load spec for the estimated tokens
+                self.load_specs[request.request_id] = LoadSpec(
+                    vllm_cached_tokens=num_computed_tokens,
+                    lmcache_cached_tokens=num_computed_tokens + estimated_tokens,
+                    can_load=False)  # Will be set to True in update_state_after_alloc
+                
+                return estimated_tokens, True  # Force async loading
+            else:
+                logger.debug("PD-Disaggregated: No tokens estimated for request %s", 
+                           request.request_id)
+                return 0, False
+        
+        # Original logic for non-PD-disaggregated cases
         token_ids = torch.tensor(request.prompt_token_ids)
         if self.skip_last_n_tokens > 0:
             num_external_hit_tokens = self.lookup_client.lookup(
@@ -664,7 +889,7 @@ class LMCacheConnectorV1Impl:
             num_external_hit_tokens, need_to_allocate)
 
         if need_to_allocate <= 0:
-            return 0
+            return 0, False
 
         self.load_specs[request.request_id] = LoadSpec(
             vllm_cached_tokens=num_computed_tokens,
@@ -674,7 +899,76 @@ class LMCacheConnectorV1Impl:
         # TODO: Align to vLLM block size. Should test whether it can be removed
         #need_to_allocate = need_to_allocate // self._block_size * \
         #        self._block_size
-        return need_to_allocate
+        return need_to_allocate, False  # Traditional lookup doesn't use async loading
+
+    def _is_pd_disaggregated_mode(self) -> bool:
+        """
+        Check if we're in PD-disaggregated mode where decoder should fetch from prefiller.
+        
+        Returns:
+            True if this is a decoder in PD-disaggregated setup
+        """
+        # Check for PD-disaggregated configuration indicators
+        # This could be controlled by environment variables or config flags
+        pd_disaggregated = self.vllm_config.kv_transfer_config.get_from_extra_config(
+            "pd_disaggregated", False)
+        
+        # In PD-disaggregated, decoder should have kv_consumer role and use layerwise
+        is_decoder = (self.kv_role == "kv_consumer" and 
+                     (self.use_layerwise or self.use_layeraware))
+        
+        return pd_disaggregated and is_decoder
+
+    def _estimate_tokens_from_prefiller(self, request: "Request", num_computed_tokens: int) -> int:
+        """
+        Estimate how many tokens might be available from the prefiller.
+        
+        For PD-disaggregated, we optimistically assume the prefiller is working on
+        the same prompt and will have layers ready progressively.
+        
+        Args:
+            request: The request object
+            num_computed_tokens: Number of tokens already computed locally
+            
+        Returns:
+            Estimated number of tokens that might be available from prefiller
+        """
+        # For new requests (first time), estimate the entire prompt might be available
+        if num_computed_tokens == 0:
+            # Estimate based on prompt length, but cap to avoid over-allocation
+            prompt_length = len(request.prompt_token_ids)
+            if self.skip_last_n_tokens > 0:
+                prompt_length -= self.skip_last_n_tokens
+            
+            # Align to chunk boundaries for efficiency
+            aligned_length = (prompt_length // self._lmcache_chunk_size) * self._lmcache_chunk_size
+            return max(aligned_length, self._lmcache_chunk_size)  # At least one chunk
+        
+        # For continuing requests, estimate remaining tokens
+        remaining_tokens = len(request.prompt_token_ids) - num_computed_tokens
+        if self.skip_last_n_tokens > 0:
+            remaining_tokens -= self.skip_last_n_tokens
+            
+        # Be conservative for continuing requests - estimate smaller chunks
+        chunk_estimate = min(remaining_tokens, self._lmcache_chunk_size * 2)
+        return max(chunk_estimate, 0)
+
+    def _get_layer_timeout_us(self) -> int:
+        """
+        Get appropriate timeout for layer retrieval based on mode.
+        
+        Returns:
+            Timeout in microseconds for retrieve_layer_when_ready
+        """
+        if self._is_pd_disaggregated_mode():
+            # For PD-disaggregated, use longer timeout since decoder waits for prefiller
+            # Default to 5 seconds per layer, configurable via extra_config
+            timeout_seconds = self.vllm_config.kv_transfer_config.get_from_extra_config(
+                "pd_layer_timeout_seconds", 1.0)
+            return int(timeout_seconds * 1_000_000)  # Convert to microseconds
+        else:
+            # For regular mode, use shorter timeout (1ms) since data should be ready
+            return 1000  # 1ms in microseconds
 
     def update_state_after_alloc(self, request: "Request",
                                  num_external_tokens: int):
@@ -756,3 +1050,100 @@ class LMCacheConnectorV1Impl:
                 meta.add_request(req_meta)
 
         return meta
+
+    # ==============================
+    # Enhanced Layer-wise Support Methods (for LMCacheConnectorV2)
+    # ==============================
+    
+    def supports_layerwise_loading(self) -> bool:
+        """
+        Check if the current LMCache engine supports layer-wise loading.
+        
+        Returns:
+            True if LayerAwareLMCacheEngine is being used, False otherwise
+        """
+        if not hasattr(self, 'lmcache_engine') or self.lmcache_engine is None:
+            return False
+            
+        # Check if we're using LayerAwareLMCacheEngine
+        try:
+            from lmcache.experimental.cache_engine import LayerAwareLMCacheEngine
+            return isinstance(self.lmcache_engine, LayerAwareLMCacheEngine)
+        except ImportError:
+            return False
+
+    def _wait_using_retrievers_enhanced(self, target_layer_id: int) -> None:
+        """
+        Enhanced retriever-based waiting with better layer tracking.
+        
+        Args:
+            target_layer_id: The layer ID to wait for
+        """
+        if not self.layerwise_retrievers:
+            logger.warning("No layerwise retrievers available for enhanced waiting")
+            return
+            
+        logger.debug(f"Using retrievers to wait for layer {target_layer_id}")
+        
+        # Wait for the layer to be loaded using retrievers
+        for retriever_idx, layerwise_retriever in enumerate(self.layerwise_retrievers):
+            # Process layers up to the target layer
+            layers_to_process = max(0, target_layer_id - self.current_layer + 1)
+            
+            for relative_layer in range(layers_to_process):
+                current_layer = self.current_layer + relative_layer
+                
+                if current_layer > target_layer_id:
+                    break
+                    
+                try:
+                    ret_token_mask = next(layerwise_retriever)
+                    
+                    if current_layer == target_layer_id:
+                        logger.debug(f"✅ Target layer {target_layer_id} processed via retriever {retriever_idx}")
+                    
+                    if current_layer == self.num_layers - 1 and ret_token_mask is not None:
+                        num_retrieved_tokens = ret_token_mask.sum().item()
+                        logger.debug(f"Retrieved {num_retrieved_tokens} tokens for final layer")
+                        
+                except StopIteration:
+                    logger.warning(f"Retriever {retriever_idx} exhausted at layer {current_layer}")
+                    break
+                except Exception as e:
+                    logger.error(f"Error in retriever {retriever_idx} at layer {current_layer}: {e}")
+                    break
+
+    def get_layer_readiness_status(self, max_layers: int = 32) -> dict:
+        """
+        Get detailed layer readiness status for debugging and monitoring.
+        
+        Args:
+            max_layers: Maximum number of layers to check
+            
+        Returns:
+            Dictionary with layer readiness information
+        """
+        if not self.supports_layerwise_loading():
+            return {"supported": False, "reason": "LayerAwareLMCacheEngine not available"}
+            
+        try:
+            layerwise_engine = self.get_layerwise_engine()
+            if not hasattr(layerwise_engine, 'wait_for_early_layers'):
+                return {"supported": False, "reason": "wait_for_early_layers not available"}
+                
+            # Quick check of layer readiness
+            ready_layers = layerwise_engine.wait_for_early_layers(
+                num_layers=max_layers,
+                timeout_us=1000  # 1ms timeout for quick check
+            )
+            
+            return {
+                "supported": True,
+                "ready_layers": ready_layers,
+                "num_ready_layers": len(ready_layers),
+                "max_ready_layer": max(ready_layers) if ready_layers else -1,
+                "engine_type": "LayerAwareLMCacheEngine"
+            }
+            
+        except Exception as e:
+            return {"supported": False, "reason": f"Error checking readiness: {e}"}
