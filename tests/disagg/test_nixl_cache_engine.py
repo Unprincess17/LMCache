@@ -14,6 +14,7 @@ from lmcache.logging import init_logger
 
 logger = init_logger(__name__)
 
+head_size = 16
 
 def generate_test_tokens(num_chunks: int, chunk_size: int) -> torch.Tensor:
     """Generate test tokens for testing.
@@ -37,7 +38,6 @@ def generate_kv_cache_paged_list_tensors(num_blocks,
     ret = []
     num_layers = 32
     num_heads = 8
-    head_size = 128
     shape = [2, num_blocks, block_size, num_heads, head_size]
 
     for i in range(num_layers):
@@ -54,12 +54,13 @@ def fill_kv_cache_with_pattern(kv_cache, slot_mapping, pattern_value=0.99):
     a recognizable pattern
     """
     print(slot_mapping.shape)
+    print(kv_cache[0].shape)
     for layer_idx, layer_tensor in tqdm(enumerate(kv_cache),
                                         total=len(kv_cache)):
         # Fill both K and V with the pattern value
         num_blocks = layer_tensor.shape[1]
         block_size = layer_tensor.shape[2]
-        new_shape = (2, num_blocks * block_size, 8, 128)
+        new_shape = (2, num_blocks * block_size, 8, head_size)
         layer_tensor.reshape(new_shape)[:, slot_mapping, :, :] = pattern_value
 
     return kv_cache

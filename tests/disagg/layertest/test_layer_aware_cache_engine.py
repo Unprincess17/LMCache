@@ -28,8 +28,8 @@ from lmcache.logging import init_logger
 
 logger = init_logger(__name__)
 
-num_layers = 32
-
+num_layers = 16
+head_size = 16
 
 def generate_test_tokens(num_chunks: int, chunk_size: int) -> torch.Tensor:
     """Generate test tokens for testing."""
@@ -46,7 +46,6 @@ def generate_kv_cache_paged_list_tensors(num_blocks,
     """Generate paged KV cache tensors with deterministic initialization for testing."""
     ret = []
     num_heads = 8
-    head_size = 128
     shape = [2, num_blocks, block_size, num_heads, head_size]
 
     for i in range(num_layers):
@@ -72,7 +71,7 @@ def fill_kv_cache_with_layer_pattern(kv_cache, slot_mapping, base_pattern=0.8):
 
         num_blocks = layer_tensor.shape[1]
         block_size = layer_tensor.shape[2]
-        new_shape = (2, num_blocks * block_size, 8, 128)
+        new_shape = (2, num_blocks * block_size, 8, head_size)
         layer_tensor.reshape(new_shape)[:, slot_mapping, :, :] = pattern_value
 
     return kv_cache
@@ -89,7 +88,7 @@ def verify_layer_pattern(kv_cache,
 
     num_blocks = layer_tensor.shape[1]
     block_size = layer_tensor.shape[2]
-    new_shape = (2, num_blocks * block_size, 8, 128)
+    new_shape = (2, num_blocks * block_size, 8, head_size)
     actual_values = layer_tensor.reshape(new_shape)[:, slot_mapping, :, :]
 
     mean_value = actual_values.mean().item()
