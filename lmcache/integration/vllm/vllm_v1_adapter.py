@@ -312,6 +312,8 @@ class LMCacheConnectorV1Impl:
         self.kv_role = vllm_config.kv_transfer_config.kv_role
         self.layers_data = None
         is_tp = vllm_config.parallel_config.tensor_parallel_size > 1
+        self.pd_disaggregated = vllm_config.kv_transfer_config.get_from_extra_config(
+            "pd_disaggregated", False)
         if role == KVConnectorRole.SCHEDULER:
             self.lookup_client = LMCacheLookupClient(role, is_tp, vllm_config)
         else:
@@ -523,9 +525,11 @@ class LMCacheConnectorV1Impl:
                     layer_id,
                     tokens,
                     token_mask,
-                    timeout_us=self._get_layer_timeout_us(),
+                    timeout_us=1000000,
                     layers_data=layers_data,
-                    num_chunks=num_chunks
+                    num_chunks=num_chunks,
+                    slot_mapping=slot_mapping,
+                    kvcaches=kvcaches
                 )
                 
                 # Log the result for debugging
@@ -825,8 +829,9 @@ class LMCacheConnectorV1Impl:
         """
         Check for external KV cache hit.
         
-        Enhanced for PD-disaggregated: Forces decoder to always fetch from prefiller
-        using retrieve_layer_when_ready with timeout-based coordination.
+        Implements policy:
+        - First decode: KV from prefiller (don't rely on scheduler waiting)
+        - Following decodes: KV from local storage
         
         Args:
             request (Request): the request object.
@@ -840,135 +845,63 @@ class LMCacheConnectorV1Impl:
         """
         if self.kv_role == "kv_producer":
             return 0, False
-
-        # Check if this is a PD-disaggregated setup (decoder fetching from prefiller)
-        is_pd_disaggregated = self._is_pd_disaggregated_mode()
         
-        if is_pd_disaggregated:
-            # For PD-disaggregated: Always try to fetch from prefiller
-            # Estimate tokens that might be available (entire prompt initially)
-            estimated_tokens = self._estimate_tokens_from_prefiller(request, num_computed_tokens)
+        # First decode: Get KV from prefiller, ensure num_new_tokens = 1
+        if num_computed_tokens == 0:
+            prompt_length = len(request.prompt_token_ids)
+            if self.skip_last_n_tokens > 0:
+                prompt_length -= self.skip_last_n_tokens
             
-            if estimated_tokens > 0:
+            # Use prompt_length - 1 to ensure num_new_tokens = 1
+            num_external_hit_tokens = max(prompt_length - 1, 0)
+            
+            if num_external_hit_tokens > 0:
                 logger.info(
-                    "PD-Disaggregated: Reqid: %s, estimated %d tokens from prefiller, "
-                    "forcing async loading", request.request_id, estimated_tokens)
+                    "First decode: Reqid: %s, External hit tokens: %d, will compute 1 new token",
+                    request.request_id, num_external_hit_tokens)
                 
-                # Set up load spec for the estimated tokens
                 self.load_specs[request.request_id] = LoadSpec(
                     vllm_cached_tokens=num_computed_tokens,
-                    lmcache_cached_tokens=num_computed_tokens + estimated_tokens,
-                    can_load=False)  # Will be set to True in update_state_after_alloc
-                
-                return estimated_tokens, True  # Force async loading
-            else:
-                logger.debug("PD-Disaggregated: No tokens estimated for request %s", 
-                           request.request_id)
-                return 0, False
+                    lmcache_cached_tokens=num_computed_tokens + num_external_hit_tokens,
+                    can_load=False)
+                return num_external_hit_tokens, False
+            
+            logger.info(
+                "First decode: Reqid: %s, No external hits, will compute all %d tokens locally",
+                request.request_id, prompt_length)
+            return 0, False
         
-        # Original logic for non-PD-disaggregated cases
+        # Following decodes: Use local storage only
         token_ids = torch.tensor(request.prompt_token_ids)
         if self.skip_last_n_tokens > 0:
             num_external_hit_tokens = self.lookup_client.lookup(
                 token_ids[:-self.skip_last_n_tokens])
         else:
             num_external_hit_tokens = self.lookup_client.lookup(token_ids)
-
-        # When prompt length is divisible by the block size and all
-        # blocks are cached, we need to recompute the last token.
-        # This will be removed in the future if vLLM's scheduler provides
-        # a better support for this case.
-        if num_external_hit_tokens == request.num_tokens:
-            num_external_hit_tokens -= 1
-
+        
         need_to_allocate = num_external_hit_tokens - num_computed_tokens
 
-        logger.info(
-            "Reqid: %s, Total tokens %d, LMCache hit tokens: %d, "
-            "need to load: %d", request.request_id, request.num_tokens,
-            num_external_hit_tokens, need_to_allocate)
+        # # In, full-prompt-hit case, we need to recompute the last token
+        # if num_external_hit_tokens == request.num_tokens:
+        #     need_to_allocate -= 1
 
         if need_to_allocate <= 0:
+            logger.debug(
+                "Following decode: Reqid: %s, No new external hits needed, "
+                "computed: %d, local hits: %d", request.request_id,
+                num_computed_tokens, num_external_hit_tokens)
             return 0, False
-
+        
+        logger.info(
+            "Following decode: Reqid: %s, Local hit tokens: %d, need to load: %d",
+            request.request_id, num_external_hit_tokens, need_to_allocate)
+        
         self.load_specs[request.request_id] = LoadSpec(
             vllm_cached_tokens=num_computed_tokens,
             lmcache_cached_tokens=num_external_hit_tokens,
             can_load=False)
-
-        # TODO: Align to vLLM block size. Should test whether it can be removed
-        #need_to_allocate = need_to_allocate // self._block_size * \
-        #        self._block_size
-        return need_to_allocate, False  # Traditional lookup doesn't use async loading
-
-    def _is_pd_disaggregated_mode(self) -> bool:
-        """
-        Check if we're in PD-disaggregated mode where decoder should fetch from prefiller.
         
-        Returns:
-            True if this is a decoder in PD-disaggregated setup
-        """
-        # Check for PD-disaggregated configuration indicators
-        # This could be controlled by environment variables or config flags
-        pd_disaggregated = self.vllm_config.kv_transfer_config.get_from_extra_config(
-            "pd_disaggregated", False)
-        
-        # In PD-disaggregated, decoder should have kv_consumer role and use layerwise
-        is_decoder = (self.kv_role == "kv_consumer" and 
-                     (self.use_layerwise or self.use_layeraware))
-        
-        return pd_disaggregated and is_decoder
-
-    def _estimate_tokens_from_prefiller(self, request: "Request", num_computed_tokens: int) -> int:
-        """
-        Estimate how many tokens might be available from the prefiller.
-        
-        For PD-disaggregated, we optimistically assume the prefiller is working on
-        the same prompt and will have layers ready progressively.
-        
-        Args:
-            request: The request object
-            num_computed_tokens: Number of tokens already computed locally
-            
-        Returns:
-            Estimated number of tokens that might be available from prefiller
-        """
-        # For new requests (first time), estimate the entire prompt might be available
-        if num_computed_tokens == 0:
-            # Estimate based on prompt length, but cap to avoid over-allocation
-            prompt_length = len(request.prompt_token_ids)
-            if self.skip_last_n_tokens > 0:
-                prompt_length -= self.skip_last_n_tokens
-            
-            # Align to chunk boundaries for efficiency
-            aligned_length = (prompt_length // self._lmcache_chunk_size) * self._lmcache_chunk_size
-            return max(aligned_length, self._lmcache_chunk_size)  # At least one chunk
-        
-        # For continuing requests, estimate remaining tokens
-        remaining_tokens = len(request.prompt_token_ids) - num_computed_tokens
-        if self.skip_last_n_tokens > 0:
-            remaining_tokens -= self.skip_last_n_tokens
-            
-        # Be conservative for continuing requests - estimate smaller chunks
-        chunk_estimate = min(remaining_tokens, self._lmcache_chunk_size * 2)
-        return max(chunk_estimate, 0)
-
-    def _get_layer_timeout_us(self) -> int:
-        """
-        Get appropriate timeout for layer retrieval based on mode.
-        
-        Returns:
-            Timeout in microseconds for retrieve_layer_when_ready
-        """
-        if self._is_pd_disaggregated_mode():
-            # For PD-disaggregated, use longer timeout since decoder waits for prefiller
-            # Default to 5 seconds per layer, configurable via extra_config
-            timeout_seconds = self.vllm_config.kv_transfer_config.get_from_extra_config(
-                "pd_layer_timeout_seconds", 1.0)
-            return int(timeout_seconds * 1_000_000)  # Convert to microseconds
-        else:
-            # For regular mode, use shorter timeout (1ms) since data should be ready
-            return 1000  # 1ms in microseconds
+        return need_to_allocate, False
 
     def update_state_after_alloc(self, request: "Request",
                                  num_external_tokens: int):

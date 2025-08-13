@@ -33,7 +33,7 @@ from lmcache.experimental.memory_management import (  # noqa: E501
     MixedMemoryAllocator)
 from lmcache.experimental.storage_backend.storage_manager import (
     DistributedStorageManager, StorageManager)
-from lmcache.experimental.token_database import (ChunkedTokenDatabase,
+from lmcache.experimental.token_database import (ChunkedTokenDatabase, LayerFirstTokenDataBase,
                                                  TokenDatabase)
 from lmcache.logging import init_logger
 from lmcache.observability import LMCacheStatsLogger, LMCStatsMonitor
@@ -1633,7 +1633,10 @@ class LMCacheEngineBuilder:
     def _Create_token_database(
         config: LMCacheEngineConfig,
         metadata: LMCacheEngineMetadata,
+        use_layeraware: bool = False,
     ) -> TokenDatabase:
+        if use_layeraware:
+            return LayerFirstTokenDataBase(config, metadata)
         return ChunkedTokenDatabase(config, metadata)
 
     @classmethod
@@ -1644,6 +1647,7 @@ class LMCacheEngineBuilder:
         metadata: LMCacheEngineMetadata,
         gpu_connector: GPUConnectorInterface,
         use_layerwise_engine: bool = False,
+        use_layeraware_engine: bool = False,
     ) -> LMCacheEngine:
         """
         Builds a new LMCacheEngine instance if it doesn't already exist for the
@@ -1655,13 +1659,17 @@ class LMCacheEngineBuilder:
         logger.info(f"Creating LMCacheEngine instance {instance_id}")
         if instance_id not in cls._instances:
             memory_allocator = cls._Create_memory_allocator(config, metadata)
-            token_database = cls._Create_token_database(config, metadata)
+            token_database = cls._Create_token_database(config, metadata, use_layeraware_engine)
             stat_logger = LMCacheStatsLogger(metadata, log_interval=10)
 
             # HACK(Jiayi): Merge two types of engine into one in the future
             engine: Union[LayerwiseLMCacheEngine, LMCacheEngine]
             if use_layerwise_engine:
                 engine = LayerwiseLMCacheEngine(config, metadata,
+                                                memory_allocator,
+                                                token_database, gpu_connector)
+            elif use_layeraware_engine:
+                engine = LayerAwareLMCacheEngine(config, metadata,
                                                 memory_allocator,
                                                 token_database, gpu_connector)
             else:

@@ -117,7 +117,8 @@ def init_lmcache_engine(
                                      parallel_config.rank, "vllm", kv_dtype,
                                      kv_shape)
     hidden_dim_size = num_kv_head * head_size
-    use_gpu = need_gpu_interm_buffer(config)
+    # use_gpu = need_gpu_interm_buffer(config)
+    use_gpu = True
 
     vllm_gpu_connector: Union[VLLMPagedMemGPUConnectorV2,
                               VLLMPagedMemLayerwiseGPUConnector]
@@ -125,8 +126,10 @@ def init_lmcache_engine(
     # FIXME(Jiayi): support non-environ config
     env_layerwise = os.getenv("LMCACHE_USE_LAYERWISE", "False")
     use_layerwise = env_layerwise.lower() in ["true", "1"]
+    env_layeraware = os.getenv("LMCACHE_USE_LAYERAWARE", "False")
+    use_layeraware = env_layeraware.lower() in ["true", "1"]
 
-    if use_layerwise:
+    if use_layerwise or use_layeraware:
         vllm_gpu_connector = VLLMPagedMemLayerwiseGPUConnector(
             hidden_dim_size,
             num_layer,
@@ -143,7 +146,8 @@ def init_lmcache_engine(
                                                         device=device)
     engine = LMCacheEngineBuilder.get_or_create(ENGINE_NAME, config, metadata,
                                                 vllm_gpu_connector,
-                                                use_layerwise)
+                                                use_layerwise,
+                                                use_layeraware)
 
     return engine
 

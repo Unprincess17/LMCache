@@ -36,7 +36,7 @@ def configure_chunk_processing_threads(
     """
     if num_threads is not None:
         os.environ['LMCACHE_CHUNK_THREADS'] = str(num_threads)
-        logger.info(f"Set chunk processing threads to {num_threads}")
+        logger.debug(f"Set chunk processing threads to {num_threads}")
     elif 'LMCACHE_CHUNK_THREADS' not in os.environ:
         # Set default based on hardware
         try:
