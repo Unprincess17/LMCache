@@ -44,6 +44,7 @@ class NixlRequest:
     keys: list[CacheEngineKey]
     metadatas: list[MemoryObjMetadata]
     init_uuid: str
+    priority: int = 0  # Priority level (higher number = higher priority, 0 = normal)
 
     def serialize(self) -> bytes:
         return pickle.dumps(self)
@@ -429,7 +430,8 @@ class NixlChannel:
                     time.sleep(0.01)
 
     def prepare_send(self, keys: list[CacheEngineKey],
-                     metadatas: list[MemoryObjMetadata]):
+                     metadatas: list[MemoryObjMetadata],
+                     priority: int = 0):
         """Prepare a send transaction by sending the request using 
         the side channel.
         """
@@ -447,7 +449,8 @@ class NixlChannel:
         init_uuid = uuid.uuid4().hex
         request = NixlRequest(keys=keys,
                               metadatas=metadatas,
-                              init_uuid=init_uuid)
+                              init_uuid=init_uuid,
+                              priority=priority)
 
         self._side_channel.send(request.serialize())
         logger.debug(

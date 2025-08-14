@@ -759,6 +759,7 @@ class LMCacheConnectorV1Impl:
                     next(layerwise_storer)
             self.current_layer += 1
 
+    @_lmcache_nvtx_annotate
     def wait_for_save(self):
         """
         Block until all the save operations is done. This is called
@@ -880,30 +881,30 @@ class LMCacheConnectorV1Impl:
             # Check if we have first decode logits available
             if self.has_first_decode_logits(request):
                 # With logits available, we can use all prompt tokens from external cache
-                external_hit_tokens = prompt_length
+                num_external_hit_tokens = prompt_length
                 logger.info(
                     "First decode: Reqid: %s, External hit tokens: %d, zero-compute decode with logits",
-                    request.request_id, external_hit_tokens)
+                    request.request_id, num_external_hit_tokens)
                     
                 self.load_specs[request.request_id] = LoadSpec(
                     vllm_cached_tokens=num_computed_tokens,
-                    lmcache_cached_tokens=num_computed_tokens + external_hit_tokens,
+                    lmcache_cached_tokens=num_computed_tokens + num_external_hit_tokens,
                     can_load=False)
-                return external_hit_tokens, False
+                return num_external_hit_tokens, False
             else:
                 # Use prompt_length - 1 to ensure num_new_tokens = 1
-                external_hit_tokens = max(prompt_length - 1, 0)
+                num_external_hit_tokens = max(prompt_length - 1, 0)
                 
-                if external_hit_tokens > 0:
+                if num_external_hit_tokens > 0:
                     logger.info(
                         "First decode: Reqid: %s, External hit tokens: %d, will compute 1 new token",
-                        request.request_id, external_hit_tokens)
+                        request.request_id, num_external_hit_tokens)
                     
                     self.load_specs[request.request_id] = LoadSpec(
                         vllm_cached_tokens=num_computed_tokens,
-                        lmcache_cached_tokens=num_computed_tokens + external_hit_tokens,
+                        lmcache_cached_tokens=num_computed_tokens + num_external_hit_tokens,
                         can_load=False)
-                    return external_hit_tokens, False
+                    return num_external_hit_tokens, False
             
             logger.info(
                 "First decode: Reqid: %s, No external hits, will compute all %d tokens locally",

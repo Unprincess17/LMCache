@@ -572,8 +572,9 @@ class DistributedStorageManager:
         self,
         keys: list[CacheEngineKey],
         metadatas: list[MemoryObjMetadata],
+        priority: int = 0,
     ) -> None:
-        self.storage_backend.register_put_tasks(keys, metadatas)
+        self.storage_backend.register_put_tasks(keys, metadatas, priority)
 
     def put(
         self,
@@ -678,6 +679,57 @@ class DistributedStorageManager:
         """
         # The NixlBackend already handles combined memory objects in its contains method
         return self.storage_backend.contains(key, pin)
+
+    def store_special_tensor_with_priority(
+        self,
+        key: CacheEngineKey,
+        tensor: torch.Tensor,
+        priority: int = 100
+    ) -> None:
+        """
+        Store a special tensor (like logits) with high priority, preempting regular KV transfers.
+        
+        This method implements a high-priority mechanism for special tensors by:
+        1. Using proper allocation process with dry_allocate and allocate
+        2. Ensuring immediate availability in the recv_obj_pool
+        3. Preempting regular KV cache transfers
+        
+        Args:
+            key: The cache engine key for the special tensor
+            tensor: The tensor to store (e.g., logits)
+            priority: Priority level (higher number = higher priority)
+        """
+        from lmcache.experimental.memory_management import MemoryObjMetadata, MemoryFormat, TensorMemoryObj
+        
+        # Create metadata for the tensor with high priority
+        metadata = MemoryObjMetadata(
+            shape=tensor.shape,
+            dtype=tensor.dtype,
+            fmt=MemoryFormat.KV_T2D  # Using token-first format for logits
+        )
+        
+        # Step 1: Dry allocate to check if we can allocate memory
+        memobj_meta = self.dry_allocate(
+            tensor.shape, tensor.dtype, fmt=MemoryFormat.KV_T2D)
+        if memobj_meta is None:
+            raise RuntimeError("Failed to dry allocate memory for special tensor")
+        
+        # Step 2: Prepare put with the keys and metadata
+        # For special tensors, we want to ensure they are processed with high priority
+        self.prepare_put([key], [memobj_meta], priority=priority)
+        
+        # Step 3: Allocate the actual memory object
+        memory_obj = self.allocate(tensor.shape, tensor.dtype, fmt=MemoryFormat.KV_T2D)
+        if memory_obj is None:
+            raise RuntimeError("Failed to allocate memory for special tensor")
+        
+        # Step 4: Copy the tensor data to the allocated memory object
+        # For special tensors, we directly copy the tensor data
+        memory_obj.tensor.copy_(tensor)
+        
+        # Step 5: Submit the put task through the storage manager
+        self.put(key, memory_obj)
+        self.commit_put()
 
     def close(self):
         self.storage_backend.close()

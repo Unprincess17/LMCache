@@ -869,16 +869,22 @@ class NixlBackend(StorageBackendInterface):
         self,
         keys: list[CacheEngineKey],
         metadatas: list[MemoryObjMetadata],
+        priority: int = 0,
     ) -> None:
         """
         Register the put tasks to the backend.
+        
+        Args:
+            keys: List of cache engine keys
+            metadatas: List of memory object metadata
+            priority: Priority level (higher number = higher priority, 0 = normal)
         """
         if len(self._registered_keys) > 0:
             raise RuntimeError("The backend has already registered put tasks.")
 
         self._registered_keys = keys
         self._registered_metadatas = metadatas
-        self._nixl_channel.prepare_send(keys=keys, metadatas=metadatas)
+        self._nixl_channel.prepare_send(keys=keys, metadatas=metadatas, priority=priority)
 
     @_lmcache_nvtx_annotate
     @torch.inference_mode()

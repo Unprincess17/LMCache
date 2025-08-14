@@ -161,7 +161,7 @@ class LMCacheEngine:
                 metadatas.append(memobj_meta)
                 steds.append((start, end))
 
-        self.storage_manager.prepare_put(keys, metadatas)
+        self.storage_manager.prepare_put(keys, metadatas, priority=0)
 
         offload_time = 0.
         put_time = 0.
@@ -435,6 +435,50 @@ class LMCacheEngine:
         self.storage_manager.close()
         logger.info("LMCacheEngine closed.")
 
+    # ==============================
+    # Special Tensor Methods (for logits and high-priority transfers)
+    # ==============================
+
+    def store_special_tensor(self, key: str, tensor: torch.Tensor) -> None:
+        """
+        Store small tensors (like logits) with high priority.
+        
+        This method should use a separate high-priority queue that preempts KV transfers.
+        
+        Args:
+            key: Unique identifier for the tensor (should use token hash instead of req_id)
+            tensor: The tensor to store (e.g., logits)
+        """
+        pass
+
+    def retrieve_special_tensor(self, key: str) -> Optional[torch.Tensor]:
+        """
+        Retrieve special tensor from recv_obj_pool immediately.
+        
+        This should preempt other transfers and return immediately from recv_obj_pool.
+        
+        Args:
+            key: Unique identifier for the tensor
+            
+        Returns:
+            The tensor if available, None otherwise
+        """
+        return None
+
+    def check_special_tensor_available(self, key: str) -> bool:
+        """
+        Check availability of special tensor without consuming it.
+        
+        This should check high-priority queue first before regular KV transfers.
+        
+        Args:
+            key: Unique identifier for the tensor
+            
+        Returns:
+            True if tensor is available, False otherwise
+        """
+        return False
+
 
 # TODO(Jiayi): Using a separate class here.
 # Should use the same class once the code is stable.
@@ -581,7 +625,7 @@ class LayerwiseLMCacheEngine(LMCacheEngine):
 
                 # Register metadata for this batch
                 t = time.perf_counter()
-                self.storage_manager.prepare_put(batch_keys, batch_metadata)
+                self.storage_manager.prepare_put(batch_keys, batch_metadata, priority=0)
                 total_prepare_time += time.perf_counter() - t
                 total_put_time += time.perf_counter() - t
 
@@ -1161,7 +1205,7 @@ class LayerAwareLMCacheEngine(LMCacheEngine):
 
         # Step 3: Register all metadata at once
         with NVTXContext("register_metadata"):
-            self.storage_manager.prepare_put(chunk_keys, chunk_metadatas)
+            self.storage_manager.prepare_put(chunk_keys, chunk_metadatas, priority=0)
 
         # Step 4: Transfer data from GPU to memory objects. Instead of using a combined keys and memorys, we allocate them individually, and batch them together.
         successful_chunks = 0
@@ -1275,7 +1319,8 @@ class LayerAwareLMCacheEngine(LMCacheEngine):
 
             # Register the single large allocation
             self.storage_manager.prepare_put([combined_layer_key],
-                                             [combined_metadata])
+                                             [combined_metadata],
+                                             priority=0)
 
             # Single allocate call for the entire layer
             combined_memory_obj = self.storage_manager.allocate(
@@ -1609,6 +1654,109 @@ class LayerAwareLMCacheEngine(LMCacheEngine):
                     memory_obj.ref_count_down()
 
         return ret_mask if torch.sum(ret_mask) > 0 else None
+
+    # ==============================
+    # Special Tensor Methods Implementation (for logits and high-priority transfers)
+    # ==============================
+
+    def store_special_tensor(self, key: str, tensor: torch.Tensor) -> None:
+        """
+        Store small tensors (like logits) with high priority.
+        
+        This method uses the Nixl backend to transfer special tensors with high priority,
+        preempting regular KV transfers. The actual transfer is handled by the storage
+        backend to ensure proper coordination between prefiller and decoder.
+        
+        Args:
+            key: Unique identifier for the tensor (should use token hash instead of req_id)
+            tensor: The tensor to store (e.g., logits)
+        """
+        logger.debug(f"Storing special tensor with key: {key}")
+        
+        # Leverage the Nixl backend to transfer the tensor with high priority
+        # Create a special key for the tensor
+        special_key = CacheEngineKey("special", key)
+        
+        # Import required modules
+        from lmcache.utils import SpecialTensorMetadata
+        
+        # Create special tensor metadata with high priority
+        special_metadata = SpecialTensorMetadata(
+            key=key,
+            shape=tensor.shape,
+            dtype=tensor.dtype,
+            priority=100  # High priority to preempt regular KV transfers
+        )
+        
+        # Store the special tensor with high priority using the storage manager
+        try:
+            self.storage_manager.store_special_tensor_with_priority(
+                special_key, tensor, priority=100)
+            logger.debug(f"Submitted special tensor for transfer with key: {key}")
+        except Exception as e:
+            logger.warning(f"Failed to submit special tensor for transfer: {e}")
+            
+        logger.debug(f"Stored special tensor with key: {key}, size: {tensor.shape}")
+
+    def retrieve_special_tensor(self, key: str) -> Optional[torch.Tensor]:
+        """
+        Retrieve special tensor from storage backend immediately.
+        
+        This preempts other transfers and returns immediately from the storage backend
+        which should have high-priority handling for special tensors.
+        
+        Args:
+            key: Unique identifier for the tensor
+            
+        Returns:
+            The tensor if available, None otherwise
+        """
+        logger.debug(f"Retrieving special tensor with key: {key}")
+        
+        # Check storage backend for the special tensor
+        special_key = CacheEngineKey("special", key)
+        
+        try:
+            memory_obj = self.storage_manager.get(special_key)
+            if memory_obj is not None:
+                tensor = memory_obj.tensor
+                logger.debug(f"Retrieved special tensor from storage backend with key: {key}, size: {tensor.shape}")
+                # Decrease reference count since we're done with this object
+                memory_obj.ref_count_down()
+                return tensor
+        except Exception as e:
+            logger.warning(f"Failed to retrieve special tensor from storage backend: {e}")
+            
+        logger.debug(f"Special tensor with key {key} not found")
+        return None
+
+    def check_special_tensor_available(self, key: str) -> bool:
+        """
+        Check availability of special tensor without consuming it.
+        
+        This checks the storage backend for the special tensor.
+        
+        Args:
+            key: Unique identifier for the tensor
+            
+        Returns:
+            True if tensor is available, False otherwise
+        """
+        logger.debug(f"Checking availability of special tensor with key: {key}")
+        
+        # Check storage backend for the special tensor
+        special_key = CacheEngineKey("special", key)
+        
+        try:
+            available = self.storage_manager.contains(special_key)
+            if available:
+                logger.debug(f"Special tensor with key {key} available in storage backend")
+                return True
+        except Exception as e:
+            logger.warning(f"Failed to check special tensor in storage backend: {e}")
+            
+        logger.debug(f"Special tensor with key {key} not available")
+        return False
 
 
 class LMCacheEngineBuilder:

@@ -493,6 +493,27 @@ class NVTXContext:
         pop_range(domain=self.domain)
 
 
+##### Special Tensor Metadata #####
+@dataclass
+class SpecialTensorMetadata:
+    """
+    Metadata for special tensors like logits that need high-priority handling.
+    
+    This class represents the metadata for special tensors with additional
+    priority information to ensure they preempt regular KV transfers.
+    """
+    key: str
+    shape: torch.Size
+    dtype: torch.dtype
+    priority: int = 100  # High priority by default (higher number = higher priority)
+    timestamp: float = 0.0
+    
+    def __post_init__(self):
+        if self.timestamp == 0.0:
+            import time
+            self.timestamp = time.time()
+
+
 ##### Threading related #####
 def thread_safe(func):
     lock = threading.Lock()

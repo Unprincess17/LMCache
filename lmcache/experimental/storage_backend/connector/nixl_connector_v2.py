@@ -138,6 +138,7 @@ class NixlRequest:
     """
     keys: list[CacheEngineKey]
     metadatas: list[MemoryObjMetadata]
+    priority: int = 0
 
     @staticmethod
     def encode_custom(obj):
@@ -170,14 +171,16 @@ class NixlRequest:
         return {
             "__type__": "NixlRequest",
             "keys": [k.to_dict() for k in self.keys],
-            "metadatas": [m.to_dict() for m in self.metadatas]
+            "metadatas": [m.to_dict() for m in self.metadatas],
+            "priority": self.priority
         }
 
     @staticmethod
     def from_dict(d):
         # Note(Kuntai): msgpack will automatically deserialize internal objects,
         # meaning d["keys"] and d["metadatas"] are already deserialized.
-        return NixlRequest(keys=d["keys"], metadatas=d["metadatas"])
+        priority = d.get("priority", 0)
+        return NixlRequest(keys=d["keys"], metadatas=d["metadatas"], priority=priority)
 
     def serialize(self) -> bytes:
         return msgpack.packb(self, default=NixlRequest.encode_custom)
@@ -526,7 +529,8 @@ class NixlSender:
     @_lmcache_nvtx_annotate
     @torch.inference_mode()
     def prepare_send(self, keys: list[CacheEngineKey],
-                     metadatas: list[MemoryObjMetadata]):
+                     metadatas: list[MemoryObjMetadata],
+                     priority: int = 0):
         """Prepare a send transaction by sending the request using 
         the side channel.
         """
@@ -537,7 +541,7 @@ class NixlSender:
                 "Another send transaction is already in progress")
 
         # Initialize connection using side channel
-        request = NixlRequest(keys=keys, metadatas=metadatas)
+        request = NixlRequest(keys=keys, metadatas=metadatas, priority=priority)
 
         self._side_channel.send(request.serialize())
         logger.debug("Sent the request with %d keys", len(request.keys))
@@ -882,12 +886,13 @@ class NixlChannel:
         return sender.dry_allocate(shape, dtype, fmt)
 
     def prepare_send(self, keys: list[CacheEngineKey],
-                     metadatas: list[MemoryObjMetadata]):
+                     metadatas: list[MemoryObjMetadata],
+                     priority: int = 0):
         """Prepare a send transaction by sending the request using 
         the side channel.
         """
         sender = self._check_sender()
-        sender.prepare_send(keys, metadatas)
+        sender.prepare_send(keys, metadatas, priority)
 
     def allocate_for_send(
         self,
