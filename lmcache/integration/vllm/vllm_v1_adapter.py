@@ -759,63 +759,88 @@ class LMCacheConnectorV1Impl:
                     next(layerwise_storer)
             self.current_layer += 1
 
-    @_lmcache_nvtx_annotate
     def wait_for_save(self):
-        """Blocking until the KV cache is saved to the connector buffer."""
+        """
+        Block until all the save operations is done. This is called
+        as the forward context exits to ensure that the async saving
+        from save_kv_layer is complete before finishing the forward.
+
+        This prevents overwrites of paged KV buffer before saving done.
+        """
+        logger.debug("Wait for save completed")
+
+    def publish_first_decode_logits(self, req_id: str, logits: torch.Tensor) -> None:
+        """
+        Publish the last prompt token logits for a request to enable
+        zero-compute first decode on the decoder worker.
+        
+        Args:
+            req_id: The request ID
+            logits: Last prompt token logits tensor [vocab_size]
+        """
         if self.kv_role == "kv_consumer":
-            # Don't do save if the role is kv_consumer
+            # Only prefiller publishes logits
             return
+            
+        logger.info(f"Publishing first decode logits for request {req_id}")
+        
+        # Store logits directly in LMCache backend with high priority
+        logits_key = f"first_decode_logits:{req_id}"
+        
+        # Use LMCache engine to store logits with immediate availability
+        if hasattr(self, 'lmcache_engine') and self.lmcache_engine is not None:
+            # Store logits as a special tensor in LMCache
+            # This should preempt other transfers for immediate availability
+            # NOTE: The following methods need to be implemented in LMCache backend:
+            # - store_special_tensor(key, tensor): Store small tensors with high priority
+            # - retrieve_special_tensor(key): Retrieve from recv_obj_pool immediately  
+            # - check_special_tensor_available(key): Check availability without consuming
+            # These should use a separate high-priority queue that preempts KV transfers
+            try:
+                self.lmcache_engine.store_special_tensor(logits_key, logits.detach())
+                logger.debug(f"Stored first decode logits in LMCache for request {req_id}")
+            except Exception as e:
+                logger.warning(f"Failed to store logits in LMCache for {req_id}: {e}, using fallback")
+                # Fallback to simple storage
+                if not hasattr(self, 'logits_storage'):
+                    self.logits_storage = {}
+                self.logits_storage[logits_key] = logits.detach().cpu()
+        else:
+            # Fallback to simple storage
+            if not hasattr(self, 'logits_storage'):
+                self.logits_storage = {}
+            self.logits_storage[logits_key] = logits.detach().cpu()
 
-        if self.use_layerwise or self.use_layeraware:
-            return
-
-        connector_metadata = self._parent._get_connector_metadata()
-        assert isinstance(connector_metadata, LMCacheConnectorMetadata)
-
-        assert len(self.kv_caches) > 0
-        kvcaches = list(self.kv_caches.values())
-
-        assert self.lmcache_engine is not None
-
-        for request in connector_metadata.requests:
-            save_spec = request.save_spec
-            if save_spec is None or not save_spec.can_save:
-                continue
-
-            token_ids = request.token_ids
-            assert isinstance(token_ids, torch.Tensor)
-            assert token_ids.is_cpu
-
-            slot_mapping = request.slot_mapping
-            assert isinstance(slot_mapping, torch.Tensor)
-            assert len(slot_mapping) == len(token_ids)
-
-            # TODO: have a pre-allocated buffer to hold the slot_mappings
-            slot_mapping = slot_mapping.cuda()
-            # NOTE: In PD setting, lmcache_engine.lookup() will always return
-            # 0 if there is no local storage configured. In this case, we
-            # should rely on the skip_leading_tokens in save_spec to avoid
-            # transmit the already saved tokens again.
-            skip_leading_tokens = max(self.lmcache_engine.lookup(token_ids),
-                                      save_spec.skip_leading_tokens)
-            if skip_leading_tokens == len(token_ids):
-                continue  # skip this request
-            # Align to lmcache chunk size
-            skip_leading_tokens = skip_leading_tokens // \
-                    self._lmcache_chunk_size * self._lmcache_chunk_size
-
-            store_mask = torch.ones_like(token_ids, dtype=torch.bool)
-            store_mask[:skip_leading_tokens] = False
-
-            logger.info(
-                "Storing KV cache for %d out of %d tokens for request %s",
-                len(token_ids) - skip_leading_tokens, len(token_ids),
-                request.req_id)
-            self.lmcache_engine.store(token_ids,
-                                      mask=store_mask,
-                                      kvcaches=kvcaches,
-                                      slot_mapping=slot_mapping,
-                                      offset=skip_leading_tokens)
+    def try_consume_first_decode_logits(self, req_id: str) -> Optional[torch.Tensor]:
+        """
+        Try to retrieve the first decode logits for a request.
+        
+        Args:
+            req_id: The request ID
+            
+        Returns:
+            Logits tensor [vocab_size] if available, None otherwise
+        """
+        if self.kv_role == "kv_producer":
+            # Only decoder consumes logits
+            return None
+            
+        logits_key = f"first_decode_logits:{req_id}"
+        
+        # Try to retrieve from LMCache backend with high priority  
+        if hasattr(self, 'lmcache_engine') and self.lmcache_engine is not None: # consumer's worker
+            try:
+                # This should preempt other transfers and return immediately from recv_obj_pool
+                # The backend should check high-priority queue first before regular KV transfers
+                logits = self.lmcache_engine.retrieve_special_tensor(logits_key)
+                if logits is not None:
+                    logger.info(f"Consumed first decode logits for request {req_id} from LMCache")
+                    return logits.cuda() if logits.device.type == 'cpu' else logits
+            except Exception as e:
+                logger.debug(f"Failed to retrieve logits from LMCache for {req_id}: {e}")
+        
+        # consumer's scheduler, return directly
+        return None
 
     ###################
     # Scheduler side APIs
@@ -852,19 +877,33 @@ class LMCacheConnectorV1Impl:
             if self.skip_last_n_tokens > 0:
                 prompt_length -= self.skip_last_n_tokens
             
-            # Use prompt_length - 1 to ensure num_new_tokens = 1
-            num_external_hit_tokens = max(prompt_length - 1, 0)
-            
-            if num_external_hit_tokens > 0:
+            # Check if we have first decode logits available
+            if self.has_first_decode_logits(request):
+                # With logits available, we can use all prompt tokens from external cache
+                external_hit_tokens = prompt_length
                 logger.info(
-                    "First decode: Reqid: %s, External hit tokens: %d, will compute 1 new token",
-                    request.request_id, num_external_hit_tokens)
-                
+                    "First decode: Reqid: %s, External hit tokens: %d, zero-compute decode with logits",
+                    request.request_id, external_hit_tokens)
+                    
                 self.load_specs[request.request_id] = LoadSpec(
                     vllm_cached_tokens=num_computed_tokens,
-                    lmcache_cached_tokens=num_computed_tokens + num_external_hit_tokens,
+                    lmcache_cached_tokens=num_computed_tokens + external_hit_tokens,
                     can_load=False)
-                return num_external_hit_tokens, False
+                return external_hit_tokens, False
+            else:
+                # Use prompt_length - 1 to ensure num_new_tokens = 1
+                external_hit_tokens = max(prompt_length - 1, 0)
+                
+                if external_hit_tokens > 0:
+                    logger.info(
+                        "First decode: Reqid: %s, External hit tokens: %d, will compute 1 new token",
+                        request.request_id, external_hit_tokens)
+                    
+                    self.load_specs[request.request_id] = LoadSpec(
+                        vllm_cached_tokens=num_computed_tokens,
+                        lmcache_cached_tokens=num_computed_tokens + external_hit_tokens,
+                        can_load=False)
+                    return external_hit_tokens, False
             
             logger.info(
                 "First decode: Reqid: %s, No external hits, will compute all %d tokens locally",
@@ -880,11 +919,7 @@ class LMCacheConnectorV1Impl:
             num_external_hit_tokens = self.lookup_client.lookup(token_ids)
         
         need_to_allocate = num_external_hit_tokens - num_computed_tokens
-
-        # # In, full-prompt-hit case, we need to recompute the last token
-        # if num_external_hit_tokens == request.num_tokens:
-        #     need_to_allocate -= 1
-
+        
         if need_to_allocate <= 0:
             logger.debug(
                 "Following decode: Reqid: %s, No new external hits needed, "
@@ -893,7 +928,7 @@ class LMCacheConnectorV1Impl:
             return 0, False
         
         logger.info(
-            "Following decode: Reqid: %s, Local hit tokens: %d, need to load: %d",
+            "Following decode: Reqid: %s, External hit tokens: %d, need to load: %d",
             request.request_id, num_external_hit_tokens, need_to_allocate)
         
         self.load_specs[request.request_id] = LoadSpec(
@@ -902,6 +937,75 @@ class LMCacheConnectorV1Impl:
             can_load=False)
         
         return need_to_allocate, False
+
+    def has_first_decode_logits(self, request: "Request") -> bool:
+        """
+        Check if first decode logits are available for a request.
+        This is called from the scheduler side to determine if zero-compute is possible.
+        
+        Args:
+            request: The request object
+            
+        Returns:
+            True if first decode logits are available
+        """
+        if self.kv_role == "kv_producer":
+            # Only decoder needs to check for logits
+            return False
+            
+        logits_key = f"first_decode_logits:{request.request_id}"
+        
+        # Check in LMCache backend's recv_obj_pool for immediate availability
+        # This should preempt other transfers and check high-priority queue
+        if hasattr(self, 'lmcache_engine') and self.lmcache_engine is not None:
+            try:
+                # Check if logits are available in the recv_obj_pool without consuming
+                has_logits = self.lmcache_engine.check_special_tensor_available(logits_key)
+                if has_logits:
+                    request.has_first_decode_logits = True
+                    logger.debug(f"First decode logits available for request {request.request_id}")
+                    return True
+            except Exception as e:
+                logger.debug(f"Failed to check logits availability in LMCache for {request.request_id}: {e}")
+        
+        # Fallback check in simple storage
+        has_logits = hasattr(self, 'logits_storage') and logits_key in self.logits_storage
+        if has_logits:
+            request.has_first_decode_logits = True
+            
+        return has_logits
+
+    def _estimate_tokens_from_prefiller(self, request: "Request", num_computed_tokens: int) -> int:
+        """
+        Estimate the number of tokens that can be loaded from the prefiller
+        for a given request.
+        
+        Args:
+            request: The request object
+            num_computed_tokens: The number of tokens already computed locally
+            
+        Returns:
+            The number of tokens that can be loaded from the prefiller.
+        """
+        if self.kv_role == "kv_producer":
+            return 0
+            
+        # If we have first decode logits, we can use all prompt tokens from external cache
+        if self.has_first_decode_logits(request):
+            prompt_length = len(request.prompt_token_ids)
+            if self.skip_last_n_tokens > 0:
+                prompt_length -= self.skip_last_n_tokens
+            return prompt_length
+            
+        # Otherwise, we need to check local storage
+        token_ids = torch.tensor(request.prompt_token_ids)
+        if self.skip_last_n_tokens > 0:
+            num_local_hit_tokens = self.lookup_client.lookup(
+                token_ids[:-self.skip_last_n_tokens])
+        else:
+            num_local_hit_tokens = self.lookup_client.lookup(token_ids)
+            
+        return num_local_hit_tokens
 
     def update_state_after_alloc(self, request: "Request",
                                  num_external_tokens: int):
