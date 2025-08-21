@@ -123,6 +123,16 @@ class LMCacheEngine:
         InitializeUsageContext(config.to_original_config(), metadata)
         self.stats_monitor = LMCStatsMonitor.GetOrCreate()
 
+    def _make_special_key(self, key: str) -> CacheEngineKey:
+        """Create a properly formatted CacheEngineKey for special tensors like logits."""
+        return CacheEngineKey(
+            fmt="special",
+            model_name=self.metadata.model_name,
+            world_size=self.metadata.world_size,
+            worker_id=self.metadata.worker_id,
+            chunk_hash=key,
+        )
+
     @_lmcache_nvtx_annotate
     @torch.inference_mode()
     def store_distributed(self,
@@ -1675,18 +1685,7 @@ class LayerAwareLMCacheEngine(LMCacheEngine):
         
         # Leverage the Nixl backend to transfer the tensor with high priority
         # Create a special key for the tensor
-        special_key = CacheEngineKey("special", key)
-        
-        # Import required modules
-        from lmcache.utils import SpecialTensorMetadata
-        
-        # Create special tensor metadata with high priority
-        special_metadata = SpecialTensorMetadata(
-            key=key,
-            shape=tensor.shape,
-            dtype=tensor.dtype,
-            priority=100  # High priority to preempt regular KV transfers
-        )
+        special_key = self._make_special_key(key)
         
         # Store the special tensor with high priority using the storage manager
         try:
@@ -1714,7 +1713,7 @@ class LayerAwareLMCacheEngine(LMCacheEngine):
         logger.debug(f"Retrieving special tensor with key: {key}")
         
         # Check storage backend for the special tensor
-        special_key = CacheEngineKey("special", key)
+        special_key = self._make_special_key(key)
         
         try:
             memory_obj = self.storage_manager.get(special_key)
@@ -1743,20 +1742,8 @@ class LayerAwareLMCacheEngine(LMCacheEngine):
             True if tensor is available, False otherwise
         """
         logger.debug(f"Checking availability of special tensor with key: {key}")
-        
-        # Check storage backend for the special tensor
-        special_key = CacheEngineKey("special", key)
-        
-        try:
-            available = self.storage_manager.contains(special_key)
-            if available:
-                logger.debug(f"Special tensor with key {key} available in storage backend")
-                return True
-        except Exception as e:
-            logger.warning(f"Failed to check special tensor in storage backend: {e}")
-            
-        logger.debug(f"Special tensor with key {key} not available")
-        return False
+        special_key = self._make_special_key(key)
+        return self.storage_manager.contains(special_key)
 
 
 class LMCacheEngineBuilder:

@@ -303,7 +303,8 @@ class LayerAwareNixlObserver(NixlObserverInterface):
 
                             tensors_to_clone.append(obj.tensor)
                             keys_to_store.append(key)
-                            num_chunks += key.chunk_num
+                            if isinstance(key, LayerCacheEngineKey):
+                                num_chunks += key.chunk_num
                         else:
                             if not isinstance(key,
                                               CombinedLayerCacheEngineKey):

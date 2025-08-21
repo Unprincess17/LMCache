@@ -699,14 +699,6 @@ class DistributedStorageManager:
             tensor: The tensor to store (e.g., logits)
             priority: Priority level (higher number = higher priority)
         """
-        from lmcache.experimental.memory_management import MemoryObjMetadata, MemoryFormat, TensorMemoryObj
-        
-        # Create metadata for the tensor with high priority
-        metadata = MemoryObjMetadata(
-            shape=tensor.shape,
-            dtype=tensor.dtype,
-            fmt=MemoryFormat.KV_T2D  # Using token-first format for logits
-        )
         
         # Step 1: Dry allocate to check if we can allocate memory
         memobj_meta = self.dry_allocate(
@@ -727,8 +719,9 @@ class DistributedStorageManager:
         # For special tensors, we directly copy the tensor data
         memory_obj.tensor.copy_(tensor)
         
-        # Step 5: Submit the put task through the storage manager
-        self.put(key, memory_obj)
+        # Step 5: Update the storage backend state (zero-copy approach)
+        self.storage_backend.update_put_state(key, memory_obj)
+        memory_obj.ref_count_down()
         self.commit_put()
 
     def close(self):

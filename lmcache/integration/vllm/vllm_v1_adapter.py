@@ -15,6 +15,7 @@
 import threading
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
+import hashlib
 
 import torch
 import vllm.envs as envs
@@ -78,6 +79,23 @@ class LMCacheLookupClient:
         result = int.from_bytes(resp, "big")
         return result
 
+    def check_special_tensor_available(self, key: str) -> bool:
+        """
+        Check if a special tensor (like first decode logits) is available in the cache.
+        
+        Args:
+            key: The cache key for the special tensor
+            
+        Returns:
+            True if the special tensor is available, False otherwise
+        """
+        # Send a special marker to indicate this is a special tensor check
+        request = [b"SPECIAL_TENSOR_CHECK", key.encode('utf-8')]
+        self.socket.send_multipart(request, copy=False)
+        resp = self.socket.recv()
+        result = bool(int.from_bytes(resp, "big"))
+        return result
+
     def close(self):
         self.socket.close(linger=0)
 
@@ -103,10 +121,19 @@ class LMCacheLookupServer:
                 #try:
                 #request = self.socket.recv()
                 frames = self.socket.recv_multipart(copy=False)
-                token_ids = self.decoder.decode(frames)
-                result = self.lmcache_engine.lookup(token_ids)
-                response = result.to_bytes(4, "big")
-                self.socket.send(response)
+                
+                # Check if this is a special tensor availability check
+                if len(frames) == 2 and bytes(frames[0].buffer) == b"SPECIAL_TENSOR_CHECK":
+                    key = bytes(frames[1].buffer).decode('utf-8')
+                    result = self.lmcache_engine.check_special_tensor_available(key)
+                    response = int(result).to_bytes(4, "big")
+                    self.socket.send(response)
+                else:
+                    # Regular token lookup
+                    token_ids = self.decoder.decode(frames)
+                    result = self.lmcache_engine.lookup(token_ids)
+                    response = result.to_bytes(4, "big")
+                    self.socket.send(response)
                 #except Exception as e:
                 #    logger.error("Error in LMCache lookup server: %s", e)
                 #    break
@@ -399,22 +426,22 @@ class LMCacheConnectorV1Impl:
         assert len(self.kv_caches) > 0
         kvcaches = list(self.kv_caches.values())
 
-        attn_metadata = forward_context.attn_metadata
-        # if attn_metadata is None:
-        #     logger.warning(
-        #         "In connector.start_load_kv, but the attn_metadata is None")
-        #     return
-
         assert self.lmcache_engine is not None
 
         self.layerwise_retrievers = []
-        self.layers_data_by_request = {}  # Store layers_data for each request
+        
+        self.layeraware_request_data = {}
         
         for request in metadata.requests:
+            tokens = request.token_ids
+            
             if request.load_spec is None:
+                # used for publish first decode logits.
+                self.layeraware_request_data[request.req_id] = {
+                    'token_ids': tokens,
+                }
                 continue
 
-            tokens = request.token_ids
             # TODO: have a pre-allocated buffer to hold the slot_mappings
             slot_mapping = request.slot_mapping.cuda()
             assert len(tokens) == len(slot_mapping)
@@ -441,22 +468,45 @@ class LMCacheConnectorV1Impl:
                 next(layerwise_retriever)
                 self.layerwise_retrievers.append(layerwise_retriever)
             elif self.use_layeraware:
+                # if request.save_spec is not None and request.save_spec.can_save:
                 # For LayerAwareLMCacheEngine, we need to group keys by layers first
                 # and store the data for later use in wait_for_layer_load
+
+                # NOTE: In PD setting, lmcache_engine.lookup() will always
+                # return 0 if there is no local storage configured.
+                # In this case, we should rely on the skip_leading_tokens in
+                # save_spec to avoid transmit the already saved tokens again.
+                skip_leading_tokens = max(
+                    self.lmcache_engine.lookup(tokens),
+                    request.save_spec.skip_leading_tokens)
+                if skip_leading_tokens == len(tokens):
+                    continue  # skip this request
+                # Align to lmcache chunk size
+                skip_leading_tokens = skip_leading_tokens // \
+                        self._lmcache_chunk_size * self._lmcache_chunk_size
+
                 layers_data = self.lmcache_engine._group_keys_by_layers_first(
                     tokens,
                     token_mask,
                 )
-                self.layers_data_by_request[request.req_id] = {
+
+                self.layeraware_request_data[request.req_id] = {
                     'layers_data': layers_data,
-                    'tokens': tokens,
+                    'token_ids': tokens,
                     'token_mask': token_mask,
                     'slot_mapping': slot_mapping,
+                    'token_mask': token_mask,
+                    'skip_leading_tokens': skip_leading_tokens,
                     'kvcaches': kvcaches,
+                    'is_load': True,
                 }
-                logger.debug(
+                logger.info(
                     f"Prepared layer-aware data for request {request.req_id}: "
                     f"{len(layers_data)} layers with data")
+                logger.info(
+                    "Preparing to store KV cache for %d out of %d tokens for request %s",
+                    len(tokens) - skip_leading_tokens, len(tokens),
+                    request.req_id)
             else:
                 ret_token_mask = self.lmcache_engine.retrieve(
                     tokens,
@@ -505,12 +555,17 @@ class LMCacheConnectorV1Impl:
                     continue
 
                 # Get the stored data for this request
-                if request.req_id not in self.layers_data_by_request:
+                if request.req_id not in self.layeraware_request_data:
                     logger.warning(f"No layer data found for request {request.req_id}")
                     continue
                 
-                request_data = self.layers_data_by_request[request.req_id]
-                tokens = request_data['tokens']
+                request_data = self.layeraware_request_data[request.req_id]
+                # Check if this request has load data
+                if 'is_load' not in request_data or not request_data['is_load']:
+                    logger.warning(f"No load data found for request {request.req_id}")
+                    continue
+                    
+                tokens = request_data['token_ids']
                 token_mask = request_data['token_mask']
                 slot_mapping = request_data['slot_mapping']
                 kvcaches = request_data['kvcaches']
@@ -770,6 +825,24 @@ class LMCacheConnectorV1Impl:
         """
         logger.debug("Wait for save completed")
 
+    def _generate_logits_key(self, token_ids: list[int]) -> str:
+        """
+        Generate a consistent logits key based on the hash of token_ids.
+        This ensures that both prefiller and decoder use the same key
+        regardless of potential req_id differences.
+        
+        Args:
+            token_ids: List of token IDs for the prompt
+            
+        Returns:
+            Consistent string key for storing/retrieving logits
+        """
+        # Convert token_ids to a consistent string representation
+        token_str = ",".join(map(str, token_ids))
+        # Create a hash for a shorter, consistent key
+        token_hash = hashlib.sha256(token_str.encode()).hexdigest()[:16]
+        return f"first_decode_logits:{token_hash}"
+
     def publish_first_decode_logits(self, req_id: str, logits: torch.Tensor) -> None:
         """
         Publish the last prompt token logits for a request to enable
@@ -782,37 +855,26 @@ class LMCacheConnectorV1Impl:
         if self.kv_role == "kv_consumer":
             # Only prefiller publishes logits
             return
+
+        if not isinstance(self.lmcache_engine, LayerAwareLMCacheEngine):
+            return
             
-        logger.info(f"Publishing first decode logits for request {req_id}")
+        # Get token_ids from the request tracker to generate consistent key
+        if req_id not in self.layeraware_request_data:
+            logger.warning(f"No request tracker found for req_id {req_id}, cannot publish logits")
+            return
+            
+        request_tracker = self.layeraware_request_data[req_id]
+        logits_key = self._generate_logits_key(request_tracker['token_ids'].tolist())
+        
+        logger.info(f"Publishing first decode logits for request {req_id} with key {logits_key}")
         
         # Store logits directly in LMCache backend with high priority
-        logits_key = f"first_decode_logits:{req_id}"
-        
-        # Use LMCache engine to store logits with immediate availability
-        if hasattr(self, 'lmcache_engine') and self.lmcache_engine is not None:
-            # Store logits as a special tensor in LMCache
-            # This should preempt other transfers for immediate availability
-            # NOTE: The following methods need to be implemented in LMCache backend:
-            # - store_special_tensor(key, tensor): Store small tensors with high priority
-            # - retrieve_special_tensor(key): Retrieve from recv_obj_pool immediately  
-            # - check_special_tensor_available(key): Check availability without consuming
-            # These should use a separate high-priority queue that preempts KV transfers
-            try:
-                self.lmcache_engine.store_special_tensor(logits_key, logits.detach())
-                logger.debug(f"Stored first decode logits in LMCache for request {req_id}")
-            except Exception as e:
-                logger.warning(f"Failed to store logits in LMCache for {req_id}: {e}, using fallback")
-                # Fallback to simple storage
-                if not hasattr(self, 'logits_storage'):
-                    self.logits_storage = {}
-                self.logits_storage[logits_key] = logits.detach().cpu()
-        else:
-            # Fallback to simple storage
-            if not hasattr(self, 'logits_storage'):
-                self.logits_storage = {}
-            self.logits_storage[logits_key] = logits.detach().cpu()
-
-    def try_consume_first_decode_logits(self, req_id: str) -> Optional[torch.Tensor]:
+        # This should preempt other transfers for immediate availability
+        self.lmcache_engine.store_special_tensor(logits_key, logits.detach())
+        logger.debug(f"Stored first decode logits in LMCache for request {req_id}")
+            
+    def try_consume_first_decode_logits(self, token_ids: list[int]) -> Optional[torch.Tensor]:
         """
         Try to retrieve the first decode logits for a request.
         
@@ -825,21 +887,18 @@ class LMCacheConnectorV1Impl:
         if self.kv_role == "kv_producer":
             # Only decoder consumes logits
             return None
-            
-        logits_key = f"first_decode_logits:{req_id}"
         
-        # Try to retrieve from LMCache backend with high priority  
-        if hasattr(self, 'lmcache_engine') and self.lmcache_engine is not None: # consumer's worker
-            try:
-                # This should preempt other transfers and return immediately from recv_obj_pool
-                # The backend should check high-priority queue first before regular KV transfers
-                logits = self.lmcache_engine.retrieve_special_tensor(logits_key)
-                if logits is not None:
-                    logger.info(f"Consumed first decode logits for request {req_id} from LMCache")
-                    return logits.cuda() if logits.device.type == 'cpu' else logits
-            except Exception as e:
-                logger.debug(f"Failed to retrieve logits from LMCache for {req_id}: {e}")
+        if not isinstance(self.lmcache_engine, LayerAwareLMCacheEngine):
+            return None
+
+        logits_key = self._generate_logits_key(token_ids)
         
+        # Retrieve from LMCache backend with high priority
+        # This should preempt other transfers and return immediately from recv_obj_pool
+        # The backend should check high-priority queue first before regular KV transfers
+        logits = self.lmcache_engine.retrieve_special_tensor(logits_key)
+        if logits is not None:
+            return logits.cuda() if logits.device.type == 'cpu' else logits
         # consumer's scheduler, return directly
         return None
 
@@ -871,7 +930,7 @@ class LMCacheConnectorV1Impl:
         """
         if self.kv_role == "kv_producer":
             return 0, False
-        
+
         # First decode: Get KV from prefiller, ensure num_new_tokens = 1
         if num_computed_tokens == 0:
             prompt_length = len(request.prompt_token_ids)
@@ -892,7 +951,9 @@ class LMCacheConnectorV1Impl:
                     can_load=False)
                 return num_external_hit_tokens, False
             else:
-                # Use prompt_length - 1 to ensure num_new_tokens = 1
+                assert not isinstance(self.lmcache_engine, LayerAwareLMCacheEngine), \
+                    "LayerAwareLMCacheEngine should have logits available"
+                # For layerwise LMCacheEngine, use prompt_length - 1 to ensure num_new_tokens = 1
                 num_external_hit_tokens = max(prompt_length - 1, 0)
                 
                 if num_external_hit_tokens > 0:
@@ -953,60 +1014,23 @@ class LMCacheConnectorV1Impl:
         if self.kv_role == "kv_producer":
             # Only decoder needs to check for logits
             return False
-            
-        logits_key = f"first_decode_logits:{request.request_id}"
         
-        # Check in LMCache backend's recv_obj_pool for immediate availability
-        # This should preempt other transfers and check high-priority queue
-        if hasattr(self, 'lmcache_engine') and self.lmcache_engine is not None:
-            try:
-                # Check if logits are available in the recv_obj_pool without consuming
-                has_logits = self.lmcache_engine.check_special_tensor_available(logits_key)
-                if has_logits:
-                    request.has_first_decode_logits = True
-                    logger.debug(f"First decode logits available for request {request.request_id}")
-                    return True
-            except Exception as e:
-                logger.debug(f"Failed to check logits availability in LMCache for {request.request_id}: {e}")
+        # Generate consistent logits key using request's prompt token_ids
+        logits_key = self._generate_logits_key(request.prompt_token_ids)
         
-        # Fallback check in simple storage
-        has_logits = hasattr(self, 'logits_storage') and logits_key in self.logits_storage
-        if has_logits:
-            request.has_first_decode_logits = True
+        # Use lookup_client to check if logits are available in the cache
+        # This goes through the proper client/server protocol
+        try:
+            has_logits = self.lookup_client.check_special_tensor_available(logits_key)
+            if has_logits:
+                request.has_first_decode_logits = True
+                logger.debug(f"First decode logits available for request {request.request_id}")
+                return True
+        except Exception as e:
+            logger.debug(f"Failed to check logits availability in LMCache for {request.request_id}: {e}")
             
-        return has_logits
-
-    def _estimate_tokens_from_prefiller(self, request: "Request", num_computed_tokens: int) -> int:
-        """
-        Estimate the number of tokens that can be loaded from the prefiller
-        for a given request.
-        
-        Args:
-            request: The request object
-            num_computed_tokens: The number of tokens already computed locally
-            
-        Returns:
-            The number of tokens that can be loaded from the prefiller.
-        """
-        if self.kv_role == "kv_producer":
-            return 0
-            
-        # If we have first decode logits, we can use all prompt tokens from external cache
-        if self.has_first_decode_logits(request):
-            prompt_length = len(request.prompt_token_ids)
-            if self.skip_last_n_tokens > 0:
-                prompt_length -= self.skip_last_n_tokens
-            return prompt_length
-            
-        # Otherwise, we need to check local storage
-        token_ids = torch.tensor(request.prompt_token_ids)
-        if self.skip_last_n_tokens > 0:
-            num_local_hit_tokens = self.lookup_client.lookup(
-                token_ids[:-self.skip_last_n_tokens])
-        else:
-            num_local_hit_tokens = self.lookup_client.lookup(token_ids)
-            
-        return num_local_hit_tokens
+        # No logits
+        return False
 
     def update_state_after_alloc(self, request: "Request",
                                  num_external_tokens: int):
@@ -1089,99 +1113,3 @@ class LMCacheConnectorV1Impl:
 
         return meta
 
-    # ==============================
-    # Enhanced Layer-wise Support Methods (for LMCacheConnectorV2)
-    # ==============================
-    
-    def supports_layerwise_loading(self) -> bool:
-        """
-        Check if the current LMCache engine supports layer-wise loading.
-        
-        Returns:
-            True if LayerAwareLMCacheEngine is being used, False otherwise
-        """
-        if not hasattr(self, 'lmcache_engine') or self.lmcache_engine is None:
-            return False
-            
-        # Check if we're using LayerAwareLMCacheEngine
-        try:
-            from lmcache.experimental.cache_engine import LayerAwareLMCacheEngine
-            return isinstance(self.lmcache_engine, LayerAwareLMCacheEngine)
-        except ImportError:
-            return False
-
-    def _wait_using_retrievers_enhanced(self, target_layer_id: int) -> None:
-        """
-        Enhanced retriever-based waiting with better layer tracking.
-        
-        Args:
-            target_layer_id: The layer ID to wait for
-        """
-        if not self.layerwise_retrievers:
-            logger.warning("No layerwise retrievers available for enhanced waiting")
-            return
-            
-        logger.debug(f"Using retrievers to wait for layer {target_layer_id}")
-        
-        # Wait for the layer to be loaded using retrievers
-        for retriever_idx, layerwise_retriever in enumerate(self.layerwise_retrievers):
-            # Process layers up to the target layer
-            layers_to_process = max(0, target_layer_id - self.current_layer + 1)
-            
-            for relative_layer in range(layers_to_process):
-                current_layer = self.current_layer + relative_layer
-                
-                if current_layer > target_layer_id:
-                    break
-                    
-                try:
-                    ret_token_mask = next(layerwise_retriever)
-                    
-                    if current_layer == target_layer_id:
-                        logger.debug(f"✅ Target layer {target_layer_id} processed via retriever {retriever_idx}")
-                    
-                    if current_layer == self.num_layers - 1 and ret_token_mask is not None:
-                        num_retrieved_tokens = ret_token_mask.sum().item()
-                        logger.debug(f"Retrieved {num_retrieved_tokens} tokens for final layer")
-                        
-                except StopIteration:
-                    logger.warning(f"Retriever {retriever_idx} exhausted at layer {current_layer}")
-                    break
-                except Exception as e:
-                    logger.error(f"Error in retriever {retriever_idx} at layer {current_layer}: {e}")
-                    break
-
-    def get_layer_readiness_status(self, max_layers: int = 32) -> dict:
-        """
-        Get detailed layer readiness status for debugging and monitoring.
-        
-        Args:
-            max_layers: Maximum number of layers to check
-            
-        Returns:
-            Dictionary with layer readiness information
-        """
-        if not self.supports_layerwise_loading():
-            return {"supported": False, "reason": "LayerAwareLMCacheEngine not available"}
-            
-        try:
-            layerwise_engine = self.get_layerwise_engine()
-            if not hasattr(layerwise_engine, 'wait_for_early_layers'):
-                return {"supported": False, "reason": "wait_for_early_layers not available"}
-                
-            # Quick check of layer readiness
-            ready_layers = layerwise_engine.wait_for_early_layers(
-                num_layers=max_layers,
-                timeout_us=1000  # 1ms timeout for quick check
-            )
-            
-            return {
-                "supported": True,
-                "ready_layers": ready_layers,
-                "num_ready_layers": len(ready_layers),
-                "max_ready_layer": max(ready_layers) if ready_layers else -1,
-                "engine_type": "LayerAwareLMCacheEngine"
-            }
-            
-        except Exception as e:
-            return {"supported": False, "reason": f"Error checking readiness: {e}"}

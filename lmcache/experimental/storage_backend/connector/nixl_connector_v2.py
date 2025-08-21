@@ -18,6 +18,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from typing import Callable, Optional, Union
+from queue import PriorityQueue
 
 import msgpack
 import torch
@@ -513,6 +514,10 @@ class NixlSender:
         # How many objects are added to the payload
         self._added_payload_count = 0
 
+        # Priority queue for requests
+        self._request_queue = PriorityQueue()
+        self._request_counter = 0  # To ensure FIFO for same priority items
+
     def get_allocator(self) -> MemoryAllocatorInterface:
         """Get the underlying allocator for the NIXL pipe"""
         return self._pipe.get_allocator()
@@ -534,6 +539,24 @@ class NixlSender:
         """Prepare a send transaction by sending the request using 
         the side channel.
         """
+        # Queue the request based on priority
+        self._request_counter += 1
+        # Use negative priority for PriorityQueue (since it's a min-heap)
+        # and use counter to ensure FIFO for same priority items
+        self._request_queue.put((-priority, self._request_counter, keys, metadatas, priority))
+        
+        # Process the highest priority request immediately if not during send
+        if not self._during_send:
+            self._process_next_request()
+
+    def _process_next_request(self):
+        """Process the next highest priority request from the queue."""
+        if self._request_queue.empty() or self._during_send:
+            return
+            
+        # Get the highest priority request
+        _, _, keys, metadatas, priority = self._request_queue.get()
+        
         if self._during_send:
             logger.error("Cannot prepare a new send transaction while another "
                          "is in progress")
@@ -544,7 +567,7 @@ class NixlSender:
         request = NixlRequest(keys=keys, metadatas=metadatas, priority=priority)
 
         self._side_channel.send(request.serialize())
-        logger.debug("Sent the request with %d keys", len(request.keys))
+        logger.debug("Sent the request with %d keys (priority: %d)", len(request.keys), priority)
 
         self._during_send = True
         self._prepared_count = len(keys)
@@ -596,6 +619,9 @@ class NixlSender:
         self._during_send = False
         self._prepared_count = 0
         self._added_payload_count = 0
+        
+        # Process the next highest priority request if any
+        self._process_next_request()
 
     def zero_copy_send_with_callback(
         self,
@@ -652,6 +678,10 @@ class NixlReceiver:
 
         # Observers
         self._observers: list[NixlObserverInterface] = []
+
+        # Priority queue for requests
+        self._request_queue = PriorityQueue()
+        self._processing_lock = threading.Lock()
 
         # Start the receiver thread
         self._running = True
@@ -728,6 +758,18 @@ class NixlReceiver:
             num_received_object += len(objs_read)
             offset += len(objs_read)
 
+    def _process_queued_requests(self):
+        """Process queued requests in priority order."""
+        with self._processing_lock:
+            while not self._request_queue.empty():
+                # Get the highest priority request
+                _, _, sender_id, request = self._request_queue.get()
+                
+                # Process the request
+                self._process_receive_transaction(sender_id=sender_id,
+                                                  keys=request.keys,
+                                                  metadatas=request.metadatas)
+
     def _receiver_loop(self):
         poller = zmq.Poller()  # type: ignore
         poller.register(self._side_channel, zmq.POLLIN)  # type: ignore
@@ -756,12 +798,14 @@ class NixlReceiver:
                         f"New sender connected with ID: {sender_id.decode()}")
                     continue
                 request = NixlRequest.deserialize(msg)
-                logger.debug("Received request with %d keys from sender %s",
-                             len(request.keys), sender_id.decode())
+                logger.debug("Received request with %d keys from sender %s (priority: %d)",
+                             len(request.keys), sender_id.decode(), request.priority)
 
-                self._process_receive_transaction(sender_id=sender_id,
-                                                  keys=request.keys,
-                                                  metadatas=request.metadatas)
+                # Queue the request based on priority
+                self._request_queue.put((-request.priority, time.time(), sender_id, request))
+                
+                # Process requests in priority order
+                self._process_queued_requests()
 
             except zmq.Again as e:  # type: ignore
                 # Handle the timeout when waiting for a message
