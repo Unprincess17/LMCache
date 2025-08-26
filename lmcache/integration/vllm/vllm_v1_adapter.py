@@ -951,8 +951,6 @@ class LMCacheConnectorV1Impl:
                     can_load=False)
                 return num_external_hit_tokens, False
             else:
-                assert not isinstance(self.lmcache_engine, LayerAwareLMCacheEngine), \
-                    "LayerAwareLMCacheEngine should have logits available"
                 # For layerwise LMCacheEngine, use prompt_length - 1 to ensure num_new_tokens = 1
                 num_external_hit_tokens = max(prompt_length - 1, 0)
                 
