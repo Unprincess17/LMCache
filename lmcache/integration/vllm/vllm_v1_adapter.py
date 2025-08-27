@@ -468,23 +468,6 @@ class LMCacheConnectorV1Impl:
                 next(layerwise_retriever)
                 self.layerwise_retrievers.append(layerwise_retriever)
             elif self.use_layeraware:
-                # if request.save_spec is not None and request.save_spec.can_save:
-                # For LayerAwareLMCacheEngine, we need to group keys by layers first
-                # and store the data for later use in wait_for_layer_load
-
-                # NOTE: In PD setting, lmcache_engine.lookup() will always
-                # return 0 if there is no local storage configured.
-                # In this case, we should rely on the skip_leading_tokens in
-                # save_spec to avoid transmit the already saved tokens again.
-                skip_leading_tokens = max(
-                    self.lmcache_engine.lookup(tokens),
-                    request.save_spec.skip_leading_tokens)
-                if skip_leading_tokens == len(tokens):
-                    continue  # skip this request
-                # Align to lmcache chunk size
-                skip_leading_tokens = skip_leading_tokens // \
-                        self._lmcache_chunk_size * self._lmcache_chunk_size
-
                 layers_data = self.lmcache_engine._group_keys_by_layers_first(
                     tokens,
                     token_mask,
@@ -495,18 +478,12 @@ class LMCacheConnectorV1Impl:
                     'token_ids': tokens,
                     'token_mask': token_mask,
                     'slot_mapping': slot_mapping,
-                    'token_mask': token_mask,
-                    'skip_leading_tokens': skip_leading_tokens,
                     'kvcaches': kvcaches,
                     'is_load': True,
                 }
-                logger.info(
+                logger.debug(
                     f"Prepared layer-aware data for request {request.req_id}: "
                     f"{len(layers_data)} layers with data")
-                logger.info(
-                    "Preparing to store KV cache for %d out of %d tokens for request %s",
-                    len(tokens) - skip_leading_tokens, len(tokens),
-                    request.req_id)
             else:
                 ret_token_mask = self.lmcache_engine.retrieve(
                     tokens,
@@ -910,6 +887,7 @@ class LMCacheConnectorV1Impl:
         self,
         request: "Request",
         num_computed_tokens: int,
+        **kwargs,
     ) -> tuple[int, bool]:
         """
         Check for external KV cache hit.
@@ -932,7 +910,7 @@ class LMCacheConnectorV1Impl:
             return 0, False
 
         # First decode: Get KV from prefiller, ensure num_new_tokens = 1
-        if num_computed_tokens == 0:
+        if num_computed_tokens == 0 and not kwargs.get("skip_logits"):
             prompt_length = len(request.prompt_token_ids)
             if self.skip_last_n_tokens > 0:
                 prompt_length -= self.skip_last_n_tokens
@@ -978,6 +956,9 @@ class LMCacheConnectorV1Impl:
         else:
             num_external_hit_tokens = self.lookup_client.lookup(token_ids)
         
+        if kwargs.get("skip_logits"):
+            num_external_hit_tokens = min(num_external_hit_tokens, request.num_tokens-1)
+
         need_to_allocate = num_external_hit_tokens - num_computed_tokens
         
         if need_to_allocate <= 0:
