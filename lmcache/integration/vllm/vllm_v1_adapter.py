@@ -600,17 +600,14 @@ class LMCacheConnectorV1Impl:
         """
         # Wait for the layer to be loaded using retrievers
         for layerwise_retriever in self.layerwise_retrievers:
-            # Process layers up to the target layer
-            for current_layer in range(target_layer_id + 1):
-                if current_layer <= self.current_layer:
-                    continue  # Already processed
-                    
-                ret_token_mask = next(layerwise_retriever)
+            # We've already processed the first setup yields in start_load_kv
 
-                if current_layer == self.num_layers - 1:
-                    assert ret_token_mask is not None
-                    num_retrieved_tokens = ret_token_mask.sum().item()
-                    logger.debug(f"Retrieved {num_retrieved_tokens} tokens for final layer")
+            ret_token_mask = next(layerwise_retriever)
+            
+            # Check if this is the final result (non-None mask)
+            if ret_token_mask is not None:
+                num_retrieved_tokens = ret_token_mask.sum().item()
+                logger.debug(f"Retrieved {num_retrieved_tokens} tokens for target {target_layer_id+1} layer.")
 
     def save_kv_layer(self, layer_name: str, kv_layer: torch.Tensor,
                       attn_metadata: "AttentionMetadata", **kwargs) -> None:
@@ -793,14 +790,51 @@ class LMCacheConnectorV1Impl:
 
     @_lmcache_nvtx_annotate
     def wait_for_save(self):
-        """
-        Block until all the save operations is done. This is called
-        as the forward context exits to ensure that the async saving
-        from save_kv_layer is complete before finishing the forward.
-
-        This prevents overwrites of paged KV buffer before saving done.
-        """
-        logger.debug("Wait for save completed")
+        """Blocking until the KV cache is saved to the connector buffer."""
+        if self.kv_role == "kv_consumer":
+            # Don't do save if the role is kv_consumer
+            return
+        if self.use_layerwise or self.use_layeraware:
+            return
+        connector_metadata = self._parent._get_connector_metadata()
+        assert isinstance(connector_metadata, LMCacheConnectorMetadata)
+        assert len(self.kv_caches) > 0
+        kvcaches = list(self.kv_caches.values())
+        assert self.lmcache_engine is not None
+        for request in connector_metadata.requests:
+            save_spec = request.save_spec
+            if save_spec is None or not save_spec.can_save:
+                continue
+            token_ids = request.token_ids
+            assert isinstance(token_ids, torch.Tensor)
+            assert token_ids.is_cpu
+            slot_mapping = request.slot_mapping
+            assert isinstance(slot_mapping, torch.Tensor)
+            assert len(slot_mapping) == len(token_ids)
+            # TODO: have a pre-allocated buffer to hold the slot_mappings
+            slot_mapping = slot_mapping.cuda()
+            # NOTE: In PD setting, lmcache_engine.lookup() will always return
+            # 0 if there is no local storage configured. In this case, we
+            # should rely on the skip_leading_tokens in save_spec to avoid
+            # transmit the already saved tokens again.
+            skip_leading_tokens = max(self.lmcache_engine.lookup(token_ids),
+                                      save_spec.skip_leading_tokens)
+            if skip_leading_tokens == len(token_ids):
+                continue  # skip this request
+            # Align to lmcache chunk size
+            skip_leading_tokens = skip_leading_tokens // \
+                    self._lmcache_chunk_size * self._lmcache_chunk_size
+            store_mask = torch.ones_like(token_ids, dtype=torch.bool)
+            store_mask[:skip_leading_tokens] = False
+            logger.info(
+                "Storing KV cache for %d out of %d tokens for request %s",
+                len(token_ids) - skip_leading_tokens, len(token_ids),
+                request.req_id)
+            self.lmcache_engine.store(token_ids,
+                                      mask=store_mask,
+                                      kvcaches=kvcaches,
+                                      slot_mapping=slot_mapping,
+                                      offset=skip_leading_tokens)
 
     def _generate_logits_key(self, token_ids: list[int]) -> str:
         """
@@ -964,7 +998,7 @@ class LMCacheConnectorV1Impl:
         if need_to_allocate <= 0:
             logger.debug(
                 "Following decode: Reqid: %s, No new external hits needed, "
-                "computed: %d, local hits: %d", request.request_id,
+                "computed: %d, External hit tokens: %d", request.request_id,
                 num_computed_tokens, num_external_hit_tokens)
             return 0, False
         

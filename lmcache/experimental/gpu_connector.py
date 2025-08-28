@@ -612,7 +612,7 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
         # free the buffer memory
         tmp_gpu_buffer_obj.ref_count_down()
 
-        logger.debug(f"Finished loading layer {num_layers}")
+        logger.debug(f"Finished loading layer {num_layers-1}")
         yield
 
     @_lmcache_nvtx_annotate
