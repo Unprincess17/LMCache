@@ -4,7 +4,7 @@ export UCX_TLS=cuda_ipc,cuda_copy,tcp
 
 # Bus: ca:00.0
 CUDA_VISIBLE_DEVICES=2 \
-python3 ../test_nixl_cache_engine.py \
+python3 test_nixl_layerwise_cache_engine.py \
     --role sender \
     --num-chunks 20 \
     --num-rounds 1 \
@@ -14,7 +14,7 @@ sender_pid=$!
 
 # Bus: e3:00.0
 CUDA_VISIBLE_DEVICES=3 \
-python3 ../test_nixl_cache_engine.py \
+python3 test_nixl_layerwise_cache_engine.py \
     --role receiver \
     --num-chunks 20 \
     --num-rounds 1 \

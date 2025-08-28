@@ -559,7 +559,7 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
 
         # Get the number of layers from the first memory objects batch
         memory_objs_layer = yield
-        num_layers = len(memory_objs_layer)
+        num_layers = len(kvcaches)
         current_stream.wait_stream(self.load_stream)
 
         # memobj -> gpu_buffer -> kvcaches
@@ -587,7 +587,6 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
 
             # memobj -> gpu_buffer -> kvcaches
             with torch.cuda.stream(self.load_stream):
-                print(len(starts), len(ends), len(memory_objs_layer))
                 for start, end, memory_obj in zip(starts,
                                                   ends,
                                                   memory_objs_layer,
@@ -613,7 +612,7 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
         # free the buffer memory
         tmp_gpu_buffer_obj.ref_count_down()
 
-        logger.debug(f"Finished loading layer {layer_id}")
+        logger.debug(f"Finished loading layer {num_layers}")
         yield
 
     @_lmcache_nvtx_annotate

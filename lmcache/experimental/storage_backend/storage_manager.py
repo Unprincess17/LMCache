@@ -626,6 +626,16 @@ class DistributedStorageManager:
         return obj
 
     @_lmcache_nvtx_annotate
+    def get_non_blocking(self, key: CacheEngineKey) -> Optional[Future]:
+        """
+        Non-blocking function to get the memory object from the storages.
+        """
+        task = self.storage_backend.get_non_blocking(key)
+        if task is not None:
+            return task
+        return None
+
+    @_lmcache_nvtx_annotate
     def layerwise_batched_get(
         self,
         keys: Sequence[Sequence[CacheEngineKey]],
@@ -644,7 +654,7 @@ class DistributedStorageManager:
             # Store all chunks for one layer
             tasks = []
             for key in keys_multi_chunk:
-                task = self.get(key)
+                task = self.get_non_blocking(key)
                 assert task is not None, f"Failed to get task for key {key}"
                 tasks.append(task)
             yield tasks

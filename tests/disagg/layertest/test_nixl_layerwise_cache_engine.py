@@ -14,6 +14,8 @@ from lmcache.logging import init_logger
 
 logger = init_logger(__name__)
 
+num_layers = 1
+head_size = 16
 
 def generate_test_tokens(num_chunks: int, chunk_size: int) -> torch.Tensor:
     """Generate test tokens for testing.
@@ -35,9 +37,7 @@ def generate_kv_cache_paged_list_tensors(num_blocks,
     Returns a list of tensors, one for each layer.
     """
     ret = []
-    num_layers = 32
     num_heads = 8
-    head_size = 128
     shape = [2, num_blocks, block_size, num_heads, head_size]
 
     for i in range(num_layers):
@@ -57,7 +57,7 @@ def fill_kv_cache_with_pattern(kv_cache, slot_mapping, pattern_value=0.99):
         # Fill both K and V with the pattern value
         num_blocks = layer_tensor.shape[1]
         block_size = layer_tensor.shape[2]
-        new_shape = (2, num_blocks * block_size, 8, 128)
+        new_shape = (2, num_blocks * block_size, 8, head_size)
         layer_tensor.reshape(new_shape)[:, slot_mapping, :, :] = pattern_value
 
     return kv_cache
@@ -74,7 +74,7 @@ def verify_kv_cache_pattern(kv_cache,
                                         total=len(kv_cache)):
         num_blocks = layer_tensor.shape[1]
         block_size = layer_tensor.shape[2]
-        new_shape = (2, num_blocks * block_size, 8, 128)
+        new_shape = (2, num_blocks * block_size, 8, head_size)
         actual_values = layer_tensor.reshape(new_shape)[:, slot_mapping, :, :]
         # Check if the mean is close to the pattern value
         mean_value = actual_values.mean().item()
@@ -120,9 +120,8 @@ def create_metadata() -> LMCacheEngineMetadata:
     """Create metadata for the LayerwiseLMCacheEngine."""
     # Define KV shape: (num_layers, 2, chunk_size, num_heads, head_dim)
     chunk_size = 256
-    num_layers = 32
-    num_heads = 32
-    head_dim = 128
+    num_heads = 8
+    head_dim = head_size
     kv_shape = (num_layers, 2, chunk_size, num_heads, head_dim)
 
     return LMCacheEngineMetadata(model_name="test_model",
@@ -180,7 +179,6 @@ if __name__ == "__main__":
 
     # Create the VLLMPagedMemLayerwiseGPUConnector
     hidden_dim = 1024
-    num_layers = 32
     gpu_connector = VLLMPagedMemLayerwiseGPUConnector(
         hidden_dim,
         num_layers,

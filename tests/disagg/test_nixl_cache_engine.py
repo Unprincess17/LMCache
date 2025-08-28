@@ -15,6 +15,7 @@ from lmcache.logging import init_logger
 logger = init_logger(__name__)
 
 head_size = 16
+num_layers = 16
 
 def generate_test_tokens(num_chunks: int, chunk_size: int) -> torch.Tensor:
     """Generate test tokens for testing.
@@ -36,7 +37,6 @@ def generate_kv_cache_paged_list_tensors(num_blocks,
     where KV are in the same tensor
     """
     ret = []
-    num_layers = 32
     num_heads = 8
     shape = [2, num_blocks, block_size, num_heads, head_size]
 
@@ -125,7 +125,6 @@ def create_metadata() -> LMCacheEngineMetadata:
     """Create metadata for the LMCacheEngine."""
     # Define KV shape: (num_layers, 2, chunk_size, num_heads, head_dim)
     chunk_size = 256
-    num_layers = 32
     num_heads = 32
     head_dim = 128
     kv_shape = (num_layers, 2, chunk_size, num_heads, head_dim)
@@ -185,7 +184,6 @@ if __name__ == "__main__":
 
     # Create the VLLMPagedMemGPUConnectorV2
     hidden_dim = 1024
-    num_layers = 32
     gpu_connector = VLLMPagedMemGPUConnectorV2(hidden_dim, num_layers)
 
     # Calculate the expected total size of data

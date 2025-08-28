@@ -1050,14 +1050,20 @@ class NixlBackend(StorageBackendInterface):
         :param key: The key of the MemoryObj to retrieve.
         :return: A Future object that will resolve to the MemoryObj, or None if the key doesn't exist.
         """
-        # First check if this key maps to a combined memory object
+        # Option 1 approach: Check for direct key first (could be reference or actual object)
+        # This matches the logic in get_blocking method for consistency
+        direct_result = self._obj_pool.get(key)
+        if direct_result is not None:
+            # For direct hits, create an immediately resolved future
+            future: Future[Optional[MemoryObj]] = Future()
+            future.set_result(direct_result)
+            return future
+
+        # Fallback to old approach: Check if this key maps to a combined memory object
+        # This is for backward compatibility with engines not using Option 1
         chunk_mapping = self.get_chunk_mapping(key)
         if chunk_mapping is not None:
             combined_key, offset_start, offset_end = chunk_mapping
-
-            # Check if the combined memory object exists
-            if not self._obj_pool.contains(combined_key):
-                return None
 
             # Create a Future object for the combined memory retrieval
             future: Future[Optional[MemoryObj]] = Future()
@@ -1070,38 +1076,27 @@ class NixlBackend(StorageBackendInterface):
                         # Extract the specific chunk
                         chunk_memory_obj = self._extract_chunk_from_combined_memory(
                             combined_memory_obj, offset_start, offset_end)
-                        future.set_result(chunk_memory_obj)
+                        if chunk_memory_obj is not None:
+                            future.set_result(chunk_memory_obj)
+                        else:
+                            logger.warning(f"Failed to extract chunk from combined memory for key {key}")
+                            future.set_result(None)
                     else:
+                        logger.debug(f"Combined memory object not found for key {combined_key}")
                         future.set_result(None)
                 except Exception as e:
+                    logger.error(f"Error in get_and_extract_chunk for key {key}: {e}")
                     future.set_exception(e)
 
-            # Start a new thread to perform the get and extract operation
-            thread = threading.Thread(target=get_and_extract_chunk)
+            # Start a daemon thread to perform the get and extract operation
+            # Daemon threads will not prevent program exit and help avoid resource leaks
+            thread = threading.Thread(target=get_and_extract_chunk, daemon=True)
             thread.start()
 
             return future
 
-        # Check for the key directly (original logic)
-        if not self.contains(key):
-            return None
-
-        # Create a Future object to represent the asynchronous operation
-        future = Future()
-
-        def get_and_set_result():
-            try:
-                # Get the memory object from the object pool
-                result = self._obj_pool.get(key)
-                future.set_result(result)
-            except Exception as e:
-                future.set_exception(e)
-
-        # Start a new thread to perform the get operation
-        thread = threading.Thread(target=get_and_set_result)
-        thread.start()
-
-        return future
+        # Key not found in either direct lookup or chunk mapping
+        return None
 
     def remove(self, key: CacheEngineKey) -> None:
         """
