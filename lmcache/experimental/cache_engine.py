@@ -1741,9 +1741,10 @@ class LayerAwareLMCacheEngine(LMCacheEngine):
         Returns:
             True if tensor is available, False otherwise
         """
-        logger.debug(f"Checking availability of special tensor with key: {key}")
         special_key = self._make_special_key(key)
-        return self.storage_manager.contains(special_key)
+        is_available = self.storage_manager.contains(special_key)
+        logger.info(f"Checked availability for special tensor (key={key}): {'available' if is_available else 'not available'}")
+        return is_available
 
 
 class LMCacheEngineBuilder:
