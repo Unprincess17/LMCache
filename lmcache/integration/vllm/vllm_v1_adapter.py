@@ -943,14 +943,12 @@ class LMCacheConnectorV1Impl:
         if self.kv_role == "kv_producer":
             return 0, False
 
-        # First decode: Get KV from prefiller, ensure num_new_tokens = 1
-        if num_computed_tokens == 0 and not kwargs.get("skip_logits"):
+        if num_computed_tokens == 0:
             prompt_length = len(request.prompt_token_ids)
             if self.skip_last_n_tokens > 0:
                 prompt_length -= self.skip_last_n_tokens
-            
-            # Check if we have first decode logits available
-            if self.has_first_decode_logits(request):
+
+            if kwargs.get("skip_logits") and self.has_first_decode_logits(request):
                 # With logits available, we can use all prompt tokens from external cache
                 num_external_hit_tokens = prompt_length
                 logger.info(
@@ -962,9 +960,9 @@ class LMCacheConnectorV1Impl:
                     lmcache_cached_tokens=num_computed_tokens + num_external_hit_tokens,
                     can_load=False)
                 return num_external_hit_tokens, False
-            else:
-                # For layerwise LMCacheEngine, use prompt_length - 1 to ensure num_new_tokens = 1
-                num_external_hit_tokens = max(prompt_length - 1, 0)
+            elif self.kv_role == "kv_consumer": 
+                # use prompt_length - 1 to ensure num_new_tokens = 1
+                num_external_hit_tokens = max(prompt_length - 1, 0) # TODO: it's strange. What is the difference between len=1's and len>1's? 
                 
                 if num_external_hit_tokens > 0:
                     logger.info(
@@ -976,12 +974,12 @@ class LMCacheConnectorV1Impl:
                         lmcache_cached_tokens=num_computed_tokens + num_external_hit_tokens,
                         can_load=False)
                     return num_external_hit_tokens, False
-            
-            logger.info(
-                "First decode: Reqid: %s, No external hits, will compute all %d tokens locally",
-                request.request_id, prompt_length)
-            return 0, False
-        
+            else: # non PD-disagg scenario
+                logger.info(
+                    "First decode: Reqid: %s, No external hits, will compute all %d tokens locally",
+                    request.request_id, prompt_length)
+                return 0, False
+                
         # Following decodes: Use local storage only
         token_ids = torch.tensor(request.prompt_token_ids)
         if self.skip_last_n_tokens > 0:
@@ -990,7 +988,7 @@ class LMCacheConnectorV1Impl:
         else:
             num_external_hit_tokens = self.lookup_client.lookup(token_ids)
         
-        if kwargs.get("skip_logits"):
+        if kwargs.get("skip_logits"): # Default is skip_logits = True
             num_external_hit_tokens = min(num_external_hit_tokens, request.num_tokens-1)
 
         need_to_allocate = num_external_hit_tokens - num_computed_tokens
