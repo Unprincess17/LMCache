@@ -557,7 +557,7 @@ class LMCacheConnectorV1Impl:
                     layer_id,
                     tokens,
                     token_mask,
-                    timeout_us=1000000,
+                    timeout_us=10000000, # 10s
                     layers_data=layers_data,
                     num_chunks=num_chunks,
                     slot_mapping=slot_mapping,
@@ -948,8 +948,8 @@ class LMCacheConnectorV1Impl:
             if self.skip_last_n_tokens > 0:
                 prompt_length -= self.skip_last_n_tokens
 
+            # Case 1: skip_logits=True with logits available (only LayerAwareLMCacheEngine)
             if kwargs.get("skip_logits") and self.has_first_decode_logits(request):
-                # With logits available, we can use all prompt tokens from external cache
                 num_external_hit_tokens = prompt_length
                 logger.info(
                     "First decode: Reqid: %s, External hit tokens: %d, zero-compute decode with logits",
@@ -960,9 +960,12 @@ class LMCacheConnectorV1Impl:
                     lmcache_cached_tokens=num_computed_tokens + num_external_hit_tokens,
                     can_load=False)
                 return num_external_hit_tokens, False
-            elif self.kv_role == "kv_consumer": 
-                # use prompt_length - 1 to ensure num_new_tokens = 1
-                num_external_hit_tokens = max(prompt_length - 1, 0) # TODO: it's strange. What is the difference between len=1's and len>1's? 
+                
+            # Case 2: PD disaggregation scenarios (kv_consumer or kv_both)
+            elif self.kv_role in ["kv_consumer", "kv_both"]:
+                # For decoder role: use prompt_length - 1 to ensure num_new_tokens = 1
+                # This works for layeraware, layerwise, and standard LMCache
+                num_external_hit_tokens = max(prompt_length - 1, 0)
                 
                 if num_external_hit_tokens > 0:
                     logger.info(
@@ -974,11 +977,16 @@ class LMCacheConnectorV1Impl:
                         lmcache_cached_tokens=num_computed_tokens + num_external_hit_tokens,
                         can_load=False)
                     return num_external_hit_tokens, False
-            else: # non PD-disagg scenario
-                logger.info(
-                    "First decode: Reqid: %s, No external hits, will compute all %d tokens locally",
-                    request.request_id, prompt_length)
-                return 0, False
+                else:
+                    # Edge case: prompt too short, fall through to case 3
+                    pass
+                    
+            # Case 3: Non-PD disaggregation or standalone LMCache scenarios
+            # When kv_role is None/empty or other cases not covered above
+            logger.info(
+                "First decode: Reqid: %s, No external hits, will compute all %d tokens locally",
+                request.request_id, prompt_length)
+            return 0, False
                 
         # Following decodes: Use local storage only
         token_ids = torch.tensor(request.prompt_token_ids)

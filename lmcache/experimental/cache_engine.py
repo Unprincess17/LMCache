@@ -1143,7 +1143,7 @@ class LayerAwareLMCacheEngine(LMCacheEngine):
             raise NotImplementedError("Non-RDMA store is not implemented")
 
         layer_time = time.perf_counter() - layer_st
-        logger.debug(
+        logger.info(
             f"Layer {layer_id} completed: {layer_stored} chunks in {layer_time*1000:.2f}ms"
         )
 
